@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -127,6 +128,47 @@ func TestMapNativeGeneratesIDWhenMissing(t *testing.T) {
 	got, ok := MapNative(Native{Kind: KindReadFile, Path: "/x"}, openCodeTools)
 	if !ok || got.ID == "" {
 		t.Fatalf("缺少上游 id 时应自行生成，得到 %+v", got)
+	}
+}
+
+// 纯对话场景：上游会把「写一段 SVG」变成一次写文件调用，
+// 那份内容就是答案，必须还原成正文而不是丢掉。
+func TestNativeToTextRendersWriteContentAsCodeBlock(t *testing.T) {
+	got := NativeToText(Native{
+		Kind: KindWriteFile, Path: "/tmp/pelican.svg", Content: "<svg></svg>",
+	})
+	if !strings.HasPrefix(got, "```xml\n") {
+		t.Fatalf("应按扩展名标注语言，得到 %q", got)
+	}
+	if !strings.Contains(got, "<svg></svg>") {
+		t.Fatalf("应包含文件内容，得到 %q", got)
+	}
+	if !strings.HasSuffix(got, "```") {
+		t.Fatalf("代码块应闭合，得到 %q", got)
+	}
+}
+
+func TestNativeToTextLanguageByExtension(t *testing.T) {
+	cases := map[string]string{
+		"/a/b.py": "```python", "/a/b.go": "```go",
+		"/a/b.unknownext": "```", "/a/b.json": "```json",
+	}
+	for path, want := range cases {
+		got := NativeToText(Native{Kind: KindWriteFile, Path: path, Content: "x"})
+		if !strings.HasPrefix(got, want+"\n") {
+			t.Errorf("%s -> %q，期望以 %q 开头", path, got[:12], want)
+		}
+	}
+}
+
+// 非写文件的工具没有可还原的内容，退回文字说明。
+func TestNativeToTextFallsBackToDescription(t *testing.T) {
+	got := NativeToText(Native{Kind: KindRunTerminal, Command: "ls"})
+	if strings.HasPrefix(got, "```") {
+		t.Fatalf("不应渲染成代码块，得到 %q", got)
+	}
+	if got == "" {
+		t.Fatal("应给出说明文字")
 	}
 }
 

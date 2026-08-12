@@ -10,6 +10,7 @@ import (
 	"cursor-proxy/internal/config"
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/reqlog"
+	"cursor-proxy/internal/tools"
 	"cursor-proxy/internal/types"
 	"cursor-proxy/internal/vpn"
 )
@@ -247,6 +248,10 @@ func TestChat(model, prompt, accountID string) TestChatResult {
 		case cursor.EventDelta:
 			text += ev.Text
 			reasoning += ev.Thinking
+		case cursor.EventToolCall:
+			// 调试台没有工具可执行，把调用内容还原成正文，
+			// 否则「写一段 SVG」这类请求会得到空回复。
+			text += toolText(ev.Tool)
 		case cursor.EventError:
 			errMsg = ev.Message
 		}
@@ -286,11 +291,49 @@ func TestChatStream(model, prompt, accountID string, onDelta func(TestDelta)) bo
 				gotText = true
 			}
 			onDelta(TestDelta{Content: ev.Text, Reasoning: ev.Thinking})
+		case cursor.EventToolCall:
+			if s := toolText(ev.Tool); s != "" {
+				gotText = true
+				onDelta(TestDelta{Content: s})
+			}
 		case cursor.EventError:
 			onDelta(TestDelta{Error: ev.Message})
 		}
 	}
 	return gotText
+}
+
+// toolText 把上游的内置工具调用还原成可读正文（调试台没有工具可执行）。
+func toolText(c *cursor.NativeToolCall) string {
+	if c == nil {
+		return ""
+	}
+	kind := tools.KindUnknown
+	switch c.Kind {
+	case cursor.ToolWriteFile:
+		kind = tools.KindWriteFile
+	case cursor.ToolReadFile:
+		kind = tools.KindReadFile
+	case cursor.ToolRunTerminal:
+		kind = tools.KindRunTerminal
+	case cursor.ToolSearchFiles:
+		kind = tools.KindSearchFiles
+	case cursor.ToolListFiles:
+		kind = tools.KindListFiles
+	case cursor.ToolDeleteFile:
+		kind = tools.KindDeleteFile
+	case cursor.ToolFetchURL:
+		kind = tools.KindFetchURL
+	case cursor.ToolTask:
+		kind = tools.KindTask
+	case cursor.ToolTodoWrite:
+		kind = tools.KindTodoWrite
+	}
+	return tools.NativeToText(tools.Native{
+		Kind: kind, Path: c.Path, Command: c.Command, Pattern: c.Pattern,
+		Content: c.Content, Prompt: c.Prompt, URL: c.URL,
+		Description: c.Description, Field: c.Field,
+	})
 }
 
 // AccountsHealth 返回账号健康快照。

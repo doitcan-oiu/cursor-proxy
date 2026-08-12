@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -276,6 +277,39 @@ func schemaRequires(def Definition, field string) bool {
 		}
 	}
 	return false
+}
+
+// 常见扩展名到代码块语言标记的映射。
+var extLanguage = map[string]string{
+	".svg": "xml", ".xml": "xml", ".html": "html", ".css": "css",
+	".js": "javascript", ".ts": "typescript", ".tsx": "tsx", ".jsx": "jsx",
+	".py": "python", ".go": "go", ".rs": "rust", ".java": "java",
+	".c": "c", ".h": "c", ".cpp": "cpp", ".sh": "bash", ".rb": "ruby",
+	".php": "php", ".sql": "sql", ".json": "json", ".yaml": "yaml",
+	".yml": "yaml", ".toml": "toml", ".md": "markdown", ".vue": "vue",
+}
+
+// NativeToText 把内置工具调用还原成给纯对话客户端看的正文。
+//
+// 上游始终是 agent 形态：即便对话里没有任何工具，问它「写一段 SVG」它也会
+// 把内容塞进一次「写文件」调用，而不是直接回答。对纯聊天客户端来说，
+// 那份内容本身就是答案——这里把它还原成代码块，避免用户只看到一句
+// 「我这就写…」然后没有下文。
+func NativeToText(n Native) string {
+	if n.Kind == KindWriteFile && n.Content != "" {
+		lang := extLanguage[strings.ToLower(filepath.Ext(n.Path))]
+		var b strings.Builder
+		b.WriteString("```")
+		b.WriteString(lang)
+		b.WriteString("\n")
+		b.WriteString(n.Content)
+		if !strings.HasSuffix(n.Content, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("```")
+		return b.String()
+	}
+	return DescribeNative(n)
 }
 
 // DescribeNative 在找不到可映射的客户端工具时，用一句人话描述这次调用，

@@ -256,7 +256,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
 					calls = append(calls, c)
 				} else {
-					emitText(tools.DescribeNative(toNative(ev.Tool)))
+					emitText(tools.NativeToText(toNative(ev.Tool)))
 				}
 			case cursor.EventError:
 				errored = true
@@ -318,7 +318,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
 				toolCalls = append(toolCalls, c)
 			} else {
-				content += tools.DescribeNative(toNative(ev.Tool))
+				content += tools.NativeToText(toNative(ev.Tool))
 			}
 		case cursor.EventError:
 			lastError = ev.Message

@@ -271,7 +271,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
 					nativeCalls = append(nativeCalls, c)
 				} else {
-					emitText(tools.DescribeNative(toNative(ev.Tool)))
+					emitText(tools.NativeToText(toNative(ev.Tool)))
 				}
 			case cursor.EventError:
 				errored = true
@@ -339,7 +339,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
 				toolCalls = append(toolCalls, c)
 			} else {
-				content += tools.DescribeNative(toNative(ev.Tool))
+				content += tools.NativeToText(toNative(ev.Tool))
 			}
 		case cursor.EventError:
 			lastError = ev.Message
