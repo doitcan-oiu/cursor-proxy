@@ -83,13 +83,29 @@ func OpenWithFailover(messages []types.Message, model string) (*OpenedStream, *c
 				break
 			}
 			buffered = append(buffered, ev)
-			if ev.Kind == cursor.EventDelta && (ev.Text != "" || ev.Thinking != "") {
+			// 只有真正的正文才算「这一轮成功了」。思考内容不算——上游存在
+			// 「只吐思考、不给正文」的空转轮次，若把思考当成已产出就没法重试了。
+			if ev.Kind == cursor.EventDelta && ev.Text != "" {
 				committed = true
 				break
 			}
 			if ev.Kind == cursor.EventEnd {
 				break
 			}
+		}
+
+		// 上游偶尔会开流即结束、只吐思考不给正文。这种空转对 agent 客户端是致命的
+		// （它会以为轮次结束而卡住），重试一次通常就正常了。
+		//
+		// 注意这里既不排除账号、也不记为账号失败：空响应是上游抖动，不是账号的问题。
+		// 早期版本按失败处理，结果单账号场景下立刻「无可用账号」，连续几次还会把
+		// 唯一的账号隔离掉。
+		if errEv == "" && !committed {
+			stream.Close()
+			cursor.ReleaseAccount(account.ID, cursor.OutcomeSuccess, "")
+			lastErr = cursor.NewUpstreamError(502, "upstream returned an empty response")
+			backoff(attempt)
+			continue
 		}
 
 		if errEv != "" && !committed {
