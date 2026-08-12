@@ -257,7 +257,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			if state.turnComplete || state.gotContent {
+			if state.turnComplete || state.gotContent || state.sawToolCall {
 				if !state.errored {
 					send(StreamEvent{Kind: EventEnd})
 				}
@@ -301,9 +301,74 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 // 上游帧的顶层字段号（逆向自 agentn.api5 的实际报文）。
 const (
 	fieldStreamMessage = 1  // 流式增量
+	fieldClientAction  = 2  // 要求客户端执行的动作（内置工具调用）
 	fieldConversation  = 4  // 会话记录回写
 	fieldHeartbeat     = 13 // StreamMessage 内的心跳（约 10s 一次）
 )
+
+// fieldClientAction 内部按「哪个字段被设置」区分工具类型（逆向自实际报文）。
+const (
+	actionSearchFiles = 5  // { 3: glob 模式, 4: 输出模式, 14: 调用 id }
+	actionReadFile    = 7  // { 1: 路径, 2: 调用 id }
+	actionWriteFile   = 9  // { 1: 路径, 2: 内容, ...: 调用 id }
+	actionRunTerminal = 14 // { 1: 命令, 4: 调用 id, 15: 说明 }
+)
+
+// firstNonEmptyString 在候选字段里取第一个非空字符串，
+// 用于容忍不同工具把调用 id 放在不同字段号上。
+func firstNonEmptyString(f map[int][]proto.Field, fields ...int) string {
+	for _, n := range fields {
+		if s := proto.FirstString(f, n); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// parseNativeToolCall 从「客户端动作」帧里解出内置工具调用。
+func parseNativeToolCall(action []byte) *NativeToolCall {
+	fields := proto.Decode(action)
+
+	if body := proto.FirstBytes(fields, actionReadFile); body != nil {
+		f := proto.Decode(body)
+		if path := proto.FirstString(f, 1); path != "" {
+			return &NativeToolCall{Kind: ToolReadFile, Path: path, ID: proto.FirstString(f, 2)}
+		}
+	}
+
+	if body := proto.FirstBytes(fields, actionRunTerminal); body != nil {
+		f := proto.Decode(body)
+		if cmd := proto.FirstString(f, 1); cmd != "" {
+			return &NativeToolCall{
+				Kind: ToolRunTerminal, Command: cmd,
+				ID: proto.FirstString(f, 4), Description: proto.FirstString(f, 15),
+			}
+		}
+	}
+
+	if body := proto.FirstBytes(fields, actionSearchFiles); body != nil {
+		f := proto.Decode(body)
+		if pattern := firstNonEmptyString(f, 3, 1, 2); pattern != "" {
+			return &NativeToolCall{
+				Kind: ToolSearchFiles, Pattern: pattern,
+				ID: firstNonEmptyString(f, 14, 4, 2),
+			}
+		}
+	}
+
+	if body := proto.FirstBytes(fields, actionWriteFile); body != nil {
+		f := proto.Decode(body)
+		if path := proto.FirstString(f, 1); path != "" {
+			return &NativeToolCall{
+				Kind: ToolWriteFile, Path: path,
+				Content: proto.FirstString(f, 2),
+				ID:      firstNonEmptyString(f, 3, 4, 14),
+			}
+		}
+	}
+
+	return nil
+}
 
 // agentStreamState 跟踪一次流的解析状态。
 type agentStreamState struct {
@@ -314,6 +379,9 @@ type agentStreamState struct {
 	sawGeneration bool
 	// turnComplete 表示上游已把整轮对话持久化，即本轮生成结束。
 	turnComplete bool
+	// sawToolCall 表示本轮下发过内置工具调用。此时即便没有正文也是正常结果，
+	// 不应被上层当成空响应而重试。
+	sawToolCall bool
 }
 
 // process 消费缓冲里完整的帧，返回是否遇到协议级结束帧。
@@ -365,6 +433,16 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				continue
 			}
 			s.sawGeneration = true
+		}
+
+		// 客户端动作帧：上游要求我们执行一次内置工具。
+		if action := proto.FirstBytes(top, fieldClientAction); action != nil {
+			if call := parseNativeToolCall(action); call != nil {
+				s.sawGeneration = true
+				s.sawToolCall = true
+				send(StreamEvent{Kind: EventToolCall, Tool: call})
+			}
+			continue
 		}
 
 		// 会话记录回写。开头也会回写一次上下文，所以只有在生成已经开始之后

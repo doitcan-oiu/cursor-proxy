@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -251,6 +252,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeSSE(sseChunk(id, body.Model, map[string]any{"content": text}, nil))
 		}
 
+		var nativeCalls []tools.Call
 		for ev := range events {
 			switch ev.Kind {
 			case cursor.EventDelta:
@@ -265,6 +267,12 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						emitText(ev.Text)
 					}
 				}
+			case cursor.EventToolCall:
+				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
+					nativeCalls = append(nativeCalls, c)
+				} else {
+					emitText(tools.DescribeNative(toNative(ev.Tool)))
+				}
 			case cursor.EventError:
 				errored = true
 				errMsg = ev.Message
@@ -274,16 +282,19 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		finish := "stop"
+		calls := nativeCalls
 		if scanner != nil {
 			emitText(scanner.Flush())
-			if calls := scanner.Calls(); len(calls) > 0 {
-				for i, c := range calls {
-					writeSSE(sseChunk(id, body.Model, map[string]any{
-						"tool_calls": []map[string]any{toolCallDelta(i, c)},
-					}, nil))
-				}
-				finish = "tool_calls"
+			// 上游原生调用优先；模型自己按文本协议写的作为补充
+			calls = append(calls, scanner.Calls()...)
+		}
+		if len(calls) > 0 {
+			for i, c := range calls {
+				writeSSE(sseChunk(id, body.Model, map[string]any{
+					"tool_calls": []map[string]any{toolCallDelta(i, c)},
+				}, nil))
 			}
+			finish = "tool_calls"
 		}
 		writeSSE(sseChunk(id, body.Model, map[string]any{}, finish))
 
@@ -318,20 +329,27 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	content := ""
 	reasoning := ""
 	lastError := ""
+	var toolCalls []tools.Call
 	for ev := range events {
-		if ev.Kind == cursor.EventDelta {
+		switch ev.Kind {
+		case cursor.EventDelta:
 			content += ev.Text
 			reasoning += ev.Thinking
-		} else if ev.Kind == cursor.EventError {
+		case cursor.EventToolCall:
+			if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
+				toolCalls = append(toolCalls, c)
+			} else {
+				content += tools.DescribeNative(toNative(ev.Tool))
+			}
+		case cursor.EventError:
 			lastError = ev.Message
 		}
 	}
 
-	var toolCalls []tools.Call
 	if len(toolDefs) > 0 {
 		var scanner tools.Scanner
 		content = scanner.Push(content) + scanner.Flush()
-		toolCalls = scanner.Calls()
+		toolCalls = append(toolCalls, scanner.Calls()...)
 	}
 
 	if content == "" && len(toolCalls) == 0 && lastError != "" {
@@ -377,6 +395,41 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": finishReason}},
 		"usage":   usagePayload(promptTokens, completionTokens),
 	})
+}
+
+// toNative 把 cursor 层的内置调用转成 tools 层的形态（两层不互相依赖）。
+func toNative(c *cursor.NativeToolCall) tools.Native {
+	if c == nil {
+		return tools.Native{}
+	}
+	kind := tools.KindReadFile
+	switch c.Kind {
+	case cursor.ToolRunTerminal:
+		kind = tools.KindRunTerminal
+	case cursor.ToolSearchFiles:
+		kind = tools.KindSearchFiles
+	case cursor.ToolWriteFile:
+		kind = tools.KindWriteFile
+	}
+	return tools.Native{
+		ID: c.ID, Kind: kind, Path: c.Path, Command: c.Command,
+		Pattern: c.Pattern, Content: c.Content, Description: c.Description,
+	}
+}
+
+// nativeBridgeEnabled 控制是否把上游内置工具调用翻译给客户端。
+//
+// 默认开启。部分模型（实测 claude-4.6-opus-max）在需要写文件时，上游只下发
+// 「读文件」而从不下发写入，会导致客户端反复读同一个不存在的文件。
+// 这种情况可以用 NATIVE_TOOL_BRIDGE=off 关掉，退回纯提示词模拟。
+var nativeBridgeEnabled = !strings.EqualFold(os.Getenv("NATIVE_TOOL_BRIDGE"), "off")
+
+// mapNativeCall 把上游内置调用映射成客户端声明的工具调用。
+func mapNativeCall(c *cursor.NativeToolCall, defs []tools.Definition) (tools.Call, bool) {
+	if c == nil || len(defs) == 0 || !nativeBridgeEnabled {
+		return tools.Call{}, false
+	}
+	return tools.MapNative(toNative(c), defs)
 }
 
 // toolCallDelta 组装流式响应里的单个 tool_call 增量。

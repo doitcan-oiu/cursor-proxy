@@ -21,7 +21,37 @@ const (
 	EventError
 	// EventEnd 流正常结束。
 	EventEnd
+	// EventToolCall 上游要求客户端执行一次工具。
+	EventToolCall
 )
+
+// NativeToolKind 是上游内置工具的类型。
+type NativeToolKind string
+
+const (
+	// ToolReadFile 读取文件，参数为路径。
+	ToolReadFile NativeToolKind = "read_file"
+	// ToolRunTerminal 执行终端命令，参数为命令行。
+	ToolRunTerminal NativeToolKind = "run_terminal"
+	// ToolSearchFiles 按 glob 模式搜索文件。
+	ToolSearchFiles NativeToolKind = "search_files"
+	// ToolWriteFile 写入文件。
+	ToolWriteFile NativeToolKind = "write_file"
+)
+
+// NativeToolCall 是上游发来的一次内置工具调用请求。
+//
+// Cursor 的 agent 并不自己执行工具，而是把调用下发给客户端执行。
+// 早期实现忽略了这些帧，表现为「模型说要做某事，然后对话就断了」。
+type NativeToolCall struct {
+	ID          string
+	Kind        NativeToolKind
+	Path        string // ToolReadFile / ToolWriteFile
+	Command     string // ToolRunTerminal
+	Pattern     string // ToolSearchFiles
+	Content     string // ToolWriteFile
+	Description string
+}
 
 // StreamEvent 是对话流里产出的单个事件。
 type StreamEvent struct {
@@ -29,6 +59,7 @@ type StreamEvent struct {
 	Text     string
 	Thinking string
 	Message  string
+	Tool     *NativeToolCall
 }
 
 func gzipBytes(b []byte) []byte {

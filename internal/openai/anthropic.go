@@ -233,14 +233,25 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			send("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": text}})
 		}
 
+		var calls []tools.Call
 		for ev := range events {
-			if ev.Kind == cursor.EventDelta && ev.Text != "" {
-				if scanner != nil {
-					emitText(scanner.Push(ev.Text))
-				} else {
-					emitText(ev.Text)
+			switch ev.Kind {
+			case cursor.EventDelta:
+				if ev.Text != "" {
+					if scanner != nil {
+						emitText(scanner.Push(ev.Text))
+					} else {
+						emitText(ev.Text)
+					}
 				}
-			} else if ev.Kind == cursor.EventError {
+			case cursor.EventToolCall:
+				// 上游内置工具调用：翻译成客户端声明的工具
+				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
+					calls = append(calls, c)
+				} else {
+					emitText(tools.DescribeNative(toNative(ev.Tool)))
+				}
+			case cursor.EventError:
 				errored = true
 				errMsg = ev.Message
 			}
@@ -249,24 +260,23 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		stopReason := "end_turn"
 		if scanner != nil {
 			emitText(scanner.Flush())
+			calls = append(calls, scanner.Calls()...)
 		}
 		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 
 		// 工具调用各占一个 tool_use 内容块，紧跟在文本块之后。
-		if scanner != nil {
-			for i, c := range scanner.Calls() {
-				idx := i + 1
-				send("content_block_start", map[string]any{
-					"type": "content_block_start", "index": idx,
-					"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": map[string]any{}},
-				})
-				send("content_block_delta", map[string]any{
-					"type": "content_block_delta", "index": idx,
-					"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Arguments},
-				})
-				send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
-				stopReason = "tool_use"
-			}
+		for i, c := range calls {
+			idx := i + 1
+			send("content_block_start", map[string]any{
+				"type": "content_block_start", "index": idx,
+				"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": map[string]any{}},
+			})
+			send("content_block_delta", map[string]any{
+				"type": "content_block_delta", "index": idx,
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Arguments},
+			})
+			send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+			stopReason = "tool_use"
 		}
 		if errored {
 			stopReason = "error"
@@ -292,19 +302,26 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 
 	content := ""
 	lastError := ""
+	var toolCalls []tools.Call
 	for ev := range events {
-		if ev.Kind == cursor.EventDelta {
+		switch ev.Kind {
+		case cursor.EventDelta:
 			content += ev.Text
-		} else if ev.Kind == cursor.EventError {
+		case cursor.EventToolCall:
+			if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
+				toolCalls = append(toolCalls, c)
+			} else {
+				content += tools.DescribeNative(toNative(ev.Tool))
+			}
+		case cursor.EventError:
 			lastError = ev.Message
 		}
 	}
 
-	var toolCalls []tools.Call
 	if len(toolDefs) > 0 {
 		var scanner tools.Scanner
 		content = scanner.Push(content) + scanner.Flush()
-		toolCalls = scanner.Calls()
+		toolCalls = append(toolCalls, scanner.Calls()...)
 	}
 
 	if content == "" && len(toolCalls) == 0 && lastError != "" {
