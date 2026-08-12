@@ -82,6 +82,19 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 
 鉴权：OpenAI 用 `Authorization: Bearer sk-...`；Anthropic 用 `x-api-key: sk-...`。
 
+### 关于 `usage`
+
+Cursor 上游不返回 token 用量，所以这里由本地计算，见 `internal/tokenize`：
+
+- 默认用真实 BPE 分词（[tiktoken-go/tokenizer](https://github.com/tiktoken-go/tokenizer)，
+  纯 Go、词表内嵌、运行时不联网），按 model 名选编码，OpenAI 系模型结果与官方一致。
+- Claude / Gemini 没有公开的官方分词器，用 `o200k_base` 近似。
+- `TOKENIZER=estimate` 可关闭分词器改用启发式，省约 3～7MB 常驻内存。
+- 完全不需要 token 计数时用 `./build.sh --lite`（即 `-tags notokenizer`）编译，
+  二进制从 ~19MB 降回 ~8MB。
+
+OpenAI 流式需要 usage 时按规范传 `stream_options: {"include_usage": true}`。
+
 ## 其它路由
 
 - `/`：内置管理界面（SPA，未知路径回落 index.html）。
@@ -105,6 +118,7 @@ internal/
   auth                Cursor 凭证 / 代理 Key / PKCE 换取 / 凭证解析
   openai              OpenAI & Anthropic 兼容处理器 + 故障转移管线
   vpn                 内置 Mihomo 机场管理
+  tokenize            token 数量估算（usage 字段与日志统计）
   manage              账号/Key/模型/测试/VPN 的统一业务门面
   server              路由装配 + /manage REST API
   webui               go:embed 内嵌管理界面 + SPA 托管

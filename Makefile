@@ -15,10 +15,15 @@ ui-deps:
 ui:
 	cd $(WEBUI_DIR) && npm run build
 
-## 先构建界面再编译二进制
+## 先构建界面再编译二进制（内嵌 BPE 词表，token 计数精确）
 build: ui
 	go build -trimpath -ldflags "-s -w" -o $(BINARY) ./cmd/server
 	@echo "构建完成 -> ./$(BINARY)"
+
+## 轻量构建：不内嵌分词器词表，token 改用启发式估算，二进制小约 11MB
+build-lite: ui
+	go build -tags notokenizer -trimpath -ldflags "-s -w" -o $(BINARY) ./cmd/server
+	@echo "构建完成(轻量) -> ./$(BINARY)"
 
 ## 只编译后端（沿用上次的界面产物）
 build-go:

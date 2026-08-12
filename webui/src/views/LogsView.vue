@@ -149,7 +149,13 @@ onUnmounted(() => window.clearInterval(timer))
                 <td class="px-6 py-3 text-steel">{{ e.account || '—' }}</td>
                 <td class="px-6 py-3 font-mono text-[12px] text-stone">{{ e.keyPrefix || '—' }}</td>
                 <td class="px-6 py-3 text-right text-steel tabular">{{ formatDuration(e.ms) }}</td>
-                <td class="px-6 py-3 text-right text-steel tabular">{{ e.chars ? `${e.chars} 字` : '—' }}</td>
+                <td class="px-6 py-3 text-right tabular">
+                  <template v-if="e.chars">
+                    <div class="text-steel">{{ e.chars }} 字</div>
+                    <div v-if="e.tokens" class="text-[12px] text-stone" title="估算值">≈{{ e.tokens }} tok</div>
+                  </template>
+                  <span v-else class="text-steel">—</span>
+                </td>
                 <td class="px-6 py-3 text-right">
                   <Badge :variant="e.status === 'ok' ? 'success' : 'danger'">
                     {{ e.status === 'ok' ? '成功' : e.httpStatus || '失败' }}

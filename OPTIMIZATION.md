@@ -89,15 +89,85 @@ shadcn-vue 的「源码归你所有」模型正好用上了——`button` / `bad
 `0600` 只挡了同机其它用户。这些凭证等价于账号登录态。建议：用一个主密钥（来自环境变量或 OS
 keychain）对 token 字段做对称加密后再落盘。Go 版沿用了明文以保持行为一致，但这是**首要**安全项。
 
-### P1：`usage`/`tokens` 计费恒为 0
-`chat.ts` / `anthropic.ts` 里 `usage` 全部硬编码 0，`output_tokens` 直接用字符数充数。对接
-需要按量计费或限流的下游会失真。建议接一个 tokenizer（如 tiktoken 的 Go 实现）估算，或至少对
-字符数做一个粗略换算并标注为估算值。
+### ~~P1：`usage`/`tokens` 计费恒为 0~~（已在 Go 版修复）
+原版 `chat.ts` 的 `usage` 三个字段全部硬编码 0；`anthropic.ts` 更糟——`input_tokens` 恒为 0，
+`output_tokens` 直接把**字符数**当 token 返回（英文约虚高 4 倍）。依赖 usage 做计费或限流的
+下游（Cherry Studio、One API 之类）会直接算错。
+
+Go 版新增 `internal/tokenize` 并接入两个端点：
+
+- OpenAI 非流式返回真实的 `prompt_tokens` / `completion_tokens` / `total_tokens`；
+  流式按规范支持 `stream_options.include_usage`，在 `[DONE]` 前补一个 `choices` 为空、
+  只带 usage 的收尾分片。
+- Anthropic 的 `message_start` 给 `input_tokens`，`message_delta` 给累计 `output_tokens`，
+  非流式两者都给。
+- 思考内容（reasoning）计入输出 token，与主流厂商的计费口径一致。
+
+**计数方式**：默认用真实 BPE 分词器
+（[tiktoken-go/tokenizer](https://github.com/tiktoken-go/tokenizer)，纯 Go 移植，
+词表随二进制内嵌，运行时不联网），按 model 名选编码——`gpt-4o/4.1/4.5/5` 走 o200k_base，
+`gpt-4/3.5` 走 cl100k_base，OpenAI 系模型的结果与官方完全一致。
+
+Claude 与 Gemini 没有公开的官方分词器，这类模型用 o200k_base 近似。它同样是现代多语言
+BPE，比按字符换算准得多，但仍是近似值——这一点在代码与文档里都写明了。
+
+最初的实现只有启发式估算（CJK 约 1 字 1 token，其余约 4 字符 1 token）。实测下来它对
+英文很准，但对中文误差明显：
+
+| 样本 | cl100k 实际 | o200k 实际 | 启发式 |
+| --- | --- | --- | --- |
+| `Hello, how are you doing today?` | 8 | 8 | 8 |
+| `你好，请用一句话介绍一下你自己。` | 18 | 10 | 16 |
+
+o200k 对中文有大量多字合并 token，启发式会高估约 60%，所以改用了真实分词器。
+启发式作为回退保留：分词器加载失败、`TOKENIZER=estimate`、或 `-tags notokenizer`
+编译时启用。
+
+**代价与取舍**：词表让二进制从 ~8MB 涨到 ~19MB，某个编码首次用到时加载约 3～7MB 常驻内存
+（懒加载，用不到的编码永远不占）。单次编码约 8.6µs，可忽略。给了两个退路：运行期
+`TOKENIZER=estimate` 只省内存，编译期 `-tags notokenizer` 连依赖一起去掉、体积回到 ~8MB。
+
+> 附带修掉一个 Go 特有的坑：`len(string)` 返回字节数而非字符数，中文在 UTF-8 下每字 3 字节，
+> 沿用原版写法会让中文输出再虚高 3 倍。现在长度统计一律用 `utf8.RuneCountInString`。
 
 ### P1：`decodeMessage` varint 用浮点累加，超大字段会丢精度
 原 `protobuf.ts` 里 `result += (b & 0x7f) * Math.pow(2, shift)`，varint 超过 2^53 会丢精度。
 虽然当前用到的字段（长度、role）都很小，但这是隐患。Go 版用标准库 `encoding/binary.Uvarint`
 （uint64），从根上避免。
+
+### ~~P1：流式对话结束后要空等 6 秒才收尾~~（已在 Go 版修复）
+原版 `agent-client.ts` 判断「生成结束」的唯一依据是**空闲超时**（`AGENT_IDLE_MS`，默认 6 秒）：
+内容不再流入、静默满 6 秒才认为结束。表现就是正文早已输出完，界面还要再转 6 秒。
+
+用 `AGENT_FRAME_DEBUG=1` 抓真实帧序列后，上游行为才清楚：
+
+```
+1{13[0B]}                        心跳，固定每 10s 一个
+4{3{...system...}} 4{1=1 ...}    开头：回写会话上下文
+1{4{1="用户要求..."}}             生成：思考
+1{1{1="答案是"}} 1{1{1="2。"}}    生成：正文增量
+4{1=4 ...} 4{1=5 ...} 4{1=7 ...} 结尾：把整轮对话作为会话记录回写
+1{13[0B]} 1{13[0B]} ...          之后只剩心跳，连接永不关闭
+```
+
+三个关键事实：**上游从不发 Connect 的 end-of-stream 帧**（信封 flag `0x02`），
+**从不关闭连接**，而且**每 10 秒发一个心跳**。所以纯靠超时是唯一出路——这就是那 6 秒。
+
+真正可用的结束信号是最后那批**会话记录回写帧**（顶层字段 4）：上游把整轮对话持久化，
+就意味着这一轮结束了。注意开头也会回写一次上下文，所以必须限定「生成已经开始之后」
+出现才算数。识别到之后把空闲窗口从 6s 缩到 `AGENT_FINISH_IDLE_MS`（默认 400ms）用于收残余帧；
+若之后又来内容则撤回判定，回到正常等待。原来的 6s 退居为识别不到结束信号时的兜底。
+
+真实账号实测：最后一个内容分片到 `[DONE]` 的间隔从 **6.019s 降到 0.403s**，
+整体请求耗时从 8.8s 降到 2.3s。
+
+顺带修掉两个相关问题：
+
+- 心跳帧以前会被当作普通数据参与解析；现在显式识别并跳过。
+- 一轮里只有思考内容、没有正文时（模型直接发起工具调用就会这样），`gotContent`
+  始终为假，旧逻辑会一路等到首字超时（60s）再报错。现在按会话记录回写正常收尾。
+
+`internal/cursor/agent_test.go` 用「发完记录仍不关闭、持续心跳」的假上游锁定了这些行为。
 
 ### P2：`checkAllAccounts` / 批量验号会打真实计费请求
 `get-current-period-usage` 和 `full_stripe_profile` 每次验号都会请求 Cursor 官方接口。账号多时

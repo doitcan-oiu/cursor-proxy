@@ -151,6 +151,9 @@ func (s *AgentStream) Close() {
 
 // StreamAgent 向 agentn.api5 发起 Run 流式对话，返回事件流。
 // 初始请求失败返回 error；流内错误以 EventError 事件下发。
+//
+// 收尾优先看 Connect 的 end-of-stream 帧，拿到即立刻结束；
+// 空闲超时只作为上游不发该帧时的兜底。
 func StreamAgent(messages []types.Message, modelID, token, proxyURL string) (*AgentStream, error) {
 	bearer := auth.ExtractBearer(token)
 	body := connectFrame(proto.EncodeAgentRequest(messages, modelID))
@@ -186,6 +189,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 
 	cfg := config.Get()
 	idle := time.Duration(cfg.AgentIdleMs) * time.Millisecond
+	finishIdle := time.Duration(cfg.AgentFinishIdleMs) * time.Millisecond
 	hardCap := time.Duration(cfg.AgentHardCapMs) * time.Millisecond
 	firstToken := time.Duration(cfg.AgentFirstTokenMs) * time.Millisecond
 	start := time.Now()
@@ -220,8 +224,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 	}()
 
 	var buffer []byte
-	gotContent := false
-	errored := false
+	var state agentStreamState
 
 	send := func(ev StreamEvent) bool {
 		select {
@@ -242,20 +245,26 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 			default:
 			}
 		}
-		timer.Reset(idle)
+		// 一旦上游回写了会话记录（本轮结束），只再留一个很短的收尾窗口收残余帧，
+		// 而不是干等整个 idle。上游永不关连接、只发心跳，这是避免尾部空等的关键。
+		wait := idle
+		if state.turnComplete {
+			wait = finishIdle
+		}
+		timer.Reset(wait)
 
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			if gotContent {
-				if !errored {
+			if state.turnComplete || state.gotContent {
+				if !state.errored {
 					send(StreamEvent{Kind: EventEnd})
 				}
 				return
 			}
 			if time.Since(start) > firstToken {
-				errored = true
+				state.errored = true
 				send(StreamEvent{Kind: EventError, Message: fmt.Sprintf(
 					"上游 %ds 未返回任何内容：出口节点可能不通或该模型在当前出口区域不可用。请在界面切换 VPN 节点后重试，或改用 auto 等可用模型。",
 					cfg.AgentFirstTokenMs/1000)})
@@ -264,33 +273,51 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 			continue
 		case ch := <-chunks:
 			if ch.err != nil {
-				if !errored && gotContent {
-					send(StreamEvent{Kind: EventEnd})
-				} else if !errored && ch.err != io.EOF {
+				if !state.errored && ch.err != io.EOF && !state.gotContent && !state.turnComplete {
 					send(StreamEvent{Kind: EventError, Message: ch.err.Error()})
-					errored = true
-				} else if !errored {
+					state.errored = true
+				} else if !state.errored {
 					send(StreamEvent{Kind: EventEnd})
 				}
 				return
 			}
 			if time.Since(start) > hardCap {
-				if !errored {
+				if !state.errored {
 					send(StreamEvent{Kind: EventEnd})
 				}
 				return
 			}
 			buffer = append(buffer, ch.data...)
-			stop := processAgentBuffer(&buffer, &gotContent, &errored, send)
-			if stop {
+			if endOfStream := state.process(&buffer, send); endOfStream {
+				if !state.errored {
+					send(StreamEvent{Kind: EventEnd})
+				}
 				return
 			}
 		}
 	}
 }
 
-// processAgentBuffer 消费缓冲里完整的帧，返回是否应结束流。
-func processAgentBuffer(buffer *[]byte, gotContent, errored *bool, send func(StreamEvent) bool) bool {
+// 上游帧的顶层字段号（逆向自 agentn.api5 的实际报文）。
+const (
+	fieldStreamMessage = 1  // 流式增量
+	fieldConversation  = 4  // 会话记录回写
+	fieldHeartbeat     = 13 // StreamMessage 内的心跳（约 10s 一次）
+)
+
+// agentStreamState 跟踪一次流的解析状态。
+type agentStreamState struct {
+	gotContent bool // 是否已产出过正文
+	errored    bool // 是否已下发过错误
+	// sawGeneration 表示生成阶段已开始。用于区分开头回写的会话上下文
+	// 与结尾回写的会话记录——两者都是 fieldConversation 帧。
+	sawGeneration bool
+	// turnComplete 表示上游已把整轮对话持久化，即本轮生成结束。
+	turnComplete bool
+}
+
+// process 消费缓冲里完整的帧，返回是否遇到协议级结束帧。
+func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) bool {
 	b := *buffer
 	pos := 0
 	for pos+5 <= len(b) {
@@ -301,6 +328,9 @@ func processAgentBuffer(buffer *[]byte, gotContent, errored *bool, send func(Str
 		}
 		payload := b[pos+5 : pos+5+int(length)]
 		pos += 5 + int(length)
+		if frameDebug {
+			debugFrame(flag, length, payload)
+		}
 		if length == 0 {
 			continue
 		}
@@ -313,12 +343,35 @@ func processAgentBuffer(buffer *[]byte, gotContent, errored *bool, send func(Str
 			payload = raw
 		}
 		if flag&0x02 != 0 {
+			// Connect 协议的 end-of-stream 帧。agentn.api5 目前不发这个，
+			// 但按协议处理，换端点或上游改行为时都能立刻收尾。
 			utf := strings.TrimSpace(string(payload))
 			if utf != "" {
 				if e := parseErrorFrame(utf); e != "" {
-					*errored = true
+					s.errored = true
 					send(StreamEvent{Kind: EventError, Message: e})
 				}
+			}
+			*buffer = b[pos:]
+			return true
+		}
+
+		top := proto.Decode(payload)
+
+		// 心跳帧：上游每 10s 一个，不代表有新数据。
+		if sm := proto.FirstBytes(top, fieldStreamMessage); sm != nil {
+			smFields := proto.Decode(sm)
+			if _, isHeartbeat := smFields[fieldHeartbeat]; isHeartbeat && len(smFields) == 1 {
+				continue
+			}
+			s.sawGeneration = true
+		}
+
+		// 会话记录回写。开头也会回写一次上下文，所以只有在生成已经开始之后
+		// 出现，才说明这一轮真的结束了。
+		if _, ok := top[fieldConversation]; ok {
+			if s.sawGeneration {
+				s.turnComplete = true
 			}
 			continue
 		}
@@ -326,7 +379,7 @@ func processAgentBuffer(buffer *[]byte, gotContent, errored *bool, send func(Str
 		utf := string(payload)
 		if strings.Contains(utf, `"error"`) {
 			if e := parseErrorFrame(utf); e != "" {
-				*errored = true
+				s.errored = true
 				send(StreamEvent{Kind: EventError, Message: e})
 			}
 			continue
@@ -334,8 +387,10 @@ func processAgentBuffer(buffer *[]byte, gotContent, errored *bool, send func(Str
 
 		delta := proto.DecodeAgentFrame(payload)
 		if delta.Content != "" || delta.Thinking != "" {
+			// 记录回写之后又来内容，说明这一轮还没完，撤回结束判定。
+			s.turnComplete = false
 			if delta.Content != "" {
-				*gotContent = true
+				s.gotContent = true
 			}
 			send(StreamEvent{Kind: EventDelta, Text: delta.Content, Thinking: delta.Thinking})
 		}

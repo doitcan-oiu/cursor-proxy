@@ -78,6 +78,7 @@ export interface LogEntry {
   httpStatus?: number
   ms: number
   chars?: number
+  tokens?: number
   error?: string
 }
 

@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/reqlog"
+	"cursor-proxy/internal/tokenize"
 	"cursor-proxy/internal/types"
 )
 
@@ -95,6 +97,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	startedAt := time.Now()
 	keyPrefix := anthropicKeyPrefix(r)
+	inputTokens := tokenize.CountMessages(model, messages)
 
 	opened, uerr := OpenWithFailover(messages, model)
 	if uerr != nil {
@@ -126,16 +129,17 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		chars := 0
+		var content strings.Builder
 		errored := false
 		errMsg := ""
 
+		// message_start 携带输入 token；输出 token 在 message_delta 里给出（Anthropic 规范）。
 		send("message_start", map[string]any{
 			"type": "message_start",
 			"message": map[string]any{
 				"id": id, "type": "message", "role": "assistant", "model": model,
 				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-				"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+				"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
 			},
 		})
 		send("content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
@@ -143,7 +147,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 
 		for ev := range events {
 			if ev.Kind == cursor.EventDelta && ev.Text != "" {
-				chars += len(ev.Text)
+				content.WriteString(ev.Text)
 				send("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": ev.Text}})
 			} else if ev.Kind == cursor.EventError {
 				errored = true
@@ -155,7 +159,12 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		if errored {
 			stopReason = "error"
 		}
-		send("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": chars}})
+		outputTokens := tokenize.CountText(model, content.String())
+		send("message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
+			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
+		})
 		send("message_stop", map[string]any{"type": "message_stop"})
 
 		outcome := cursor.OutcomeSuccess
@@ -164,7 +173,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor.ReleaseAccount(account.ID, outcome, "")
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
-			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(), Chars: chars, Error: trunc(errMsg, 200)})
+			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(),
+			Chars: utf8.RuneCountInString(content.String()), Tokens: outputTokens, Error: trunc(errMsg, 200)})
 		return
 	}
 
@@ -186,14 +196,16 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cursor.ReleaseAccount(account.ID, cursor.OutcomeSuccess, "")
+	outputTokens := tokenize.CountText(model, content)
 	reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
-		Stream: false, Status: "ok", Ms: time.Since(startedAt).Milliseconds(), Chars: len(content)})
+		Stream: false, Status: "ok", Ms: time.Since(startedAt).Milliseconds(),
+		Chars: utf8.RuneCountInString(content), Tokens: outputTokens})
 	WriteJSON(w, 200, map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": model,
 		"content":       []map[string]any{{"type": "text", "text": content}},
 		"stop_reason":   "end_turn",
 		"stop_sequence": nil,
-		"usage":         map[string]any{"input_tokens": 0, "output_tokens": len(content)},
+		"usage":         map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
 	})
 }
 

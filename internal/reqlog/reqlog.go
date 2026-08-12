@@ -19,7 +19,9 @@ type Entry struct {
 	HTTPStatus int    `json:"httpStatus,omitempty"`
 	Ms         int64  `json:"ms"`
 	Chars      int    `json:"chars,omitempty"`
-	Error      string `json:"error,omitempty"`
+	// Tokens 是输出 token 的估算值（见 internal/tokenize）。
+	Tokens int    `json:"tokens,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // Stats 汇总统计。
