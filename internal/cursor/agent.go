@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"cursor-proxy/internal/auth"
 	"cursor-proxy/internal/config"
@@ -315,11 +317,22 @@ const (
 // 例：2{12{1{1:"/a.py" 6:"内容"}}} 表示写文件。
 const (
 	toolRunTerminal = 1  // { 1: 命令, 5: 简称, 15: 说明 }
+	toolDeleteFile  = 3  // { 1: 路径 }
+	toolListFiles   = 4  // { 2: glob 模式 }
 	toolSearchFiles = 5  // { 1: 查询串, 4: 输出模式 }
 	toolReadFile    = 8  // { 1: 路径 }
 	toolWriteFile   = 12 // { 1: 路径, 6: 内容 }
 	toolTask        = 19 // { 1: 任务描述, 2: 任务提示词, 4: 模型 }
+	toolTodoWrite   = 23 // { 1: 描述, 2: 待办条目 }
+	toolFetchURL    = 37 // { 1: URL }
 )
+
+// knownToolFields 用于识别「出现了工具调用，但我们还不认识」的情况。
+var knownToolFields = map[int]bool{
+	toolRunTerminal: true, toolDeleteFile: true, toolListFiles: true,
+	toolSearchFiles: true, toolReadFile: true, toolWriteFile: true,
+	toolTask: true, toolTodoWrite: true, toolFetchURL: true,
+}
 
 // parseNativeToolCall 从「工具调用完成」帧里解出内置工具调用。
 //
@@ -385,7 +398,83 @@ func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
 			}
 		}
 	}
+	if a := args(toolDeleteFile); a != nil {
+		if path := proto.FirstString(a, 1); path != "" {
+			return &NativeToolCall{Kind: ToolDeleteFile, ID: id, Path: path}
+		}
+	}
+	if a := args(toolListFiles); a != nil {
+		// 这个工具的模式放在子字段 2，与搜索不同
+		if pattern := firstNonEmpty(a, 2, 1); pattern != "" {
+			return &NativeToolCall{Kind: ToolListFiles, ID: id, Pattern: pattern}
+		}
+	}
+	if a := args(toolFetchURL); a != nil {
+		if url := proto.FirstString(a, 1); url != "" {
+			return &NativeToolCall{Kind: ToolFetchURL, ID: id, URL: url}
+		}
+	}
+	if a := args(toolTodoWrite); a != nil {
+		return &NativeToolCall{
+			Kind: ToolTodoWrite, ID: id,
+			Description: proto.FirstString(a, 1),
+		}
+	}
+
+	// 走到这里说明上游用了我们还不认识的工具。必须报出来——直接丢弃会让
+	// 客户端收不到任何调用，对话就那样断掉，且无从排查。
+	for field := range w {
+		if field == 57 || field == 59 || knownToolFields[field] {
+			continue
+		}
+		if body := proto.FirstBytes(w, field); body != nil {
+			return &NativeToolCall{
+				Kind: ToolUnknown, ID: id, Field: field,
+				Description: firstStringDeep(body, 3),
+			}
+		}
+	}
 	return nil
+}
+
+// firstNonEmpty 依次尝试若干字段，返回第一个非空字符串。
+func firstNonEmpty(f map[int][]proto.Field, fields ...int) string {
+	for _, n := range fields {
+		if s := proto.FirstString(f, n); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// firstStringDeep 在嵌套报文里找出第一个可打印字符串，用于给未知工具一个可读线索。
+func firstStringDeep(data []byte, depth int) string {
+	if depth < 0 {
+		return ""
+	}
+	for _, entries := range proto.Decode(data) {
+		for _, f := range entries {
+			if f.WireType != 2 || len(f.Bytes) == 0 {
+				continue
+			}
+			if s := string(f.Bytes); utf8.ValidString(s) && isPrintableText(s) {
+				return s
+			}
+			if s := firstStringDeep(f.Bytes, depth-1); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func isPrintableText(s string) bool {
+	for _, r := range s {
+		if r < 0x20 && r != '\n' && r != '\t' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // agentStreamState 跟踪一次流的解析状态。
@@ -461,6 +550,10 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				}
 				s.emitted[call.ID] = true
 				s.sawToolCall = true
+				if call.Kind == ToolUnknown {
+					log.Printf("[cursor] 未识别的上游工具：参数容器字段 %d（线索: %q）。"+
+						"请用 AGENT_FRAME_DEBUG=1 抓帧后补充映射。", call.Field, trunc(call.Description, 80))
+				}
 				send(StreamEvent{Kind: EventToolCall, Tool: call})
 				continue
 			}
@@ -501,4 +594,12 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 	}
 	*buffer = b[pos:]
 	return false
+}
+
+// trunc 截断日志里的长字符串。
+func trunc(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }

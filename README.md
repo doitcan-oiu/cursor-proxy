@@ -102,16 +102,25 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 下发给客户端执行；这些调用原先被整个忽略，表现就是「模型说要做某事，然后对话断了」。
 现在会解析出来并按名称与 JSON Schema 映射到客户端声明的对应工具。已覆盖的内置工具：
 
-| 上游工具 | 映射到客户端的 |
+| 上游工具（参数容器字段号） | 映射到客户端的 |
 | --- | --- |
-| 执行终端命令 | `bash` / `shell` / `run_terminal_cmd` … |
-| 读文件 | `read` / `view_file` / `cat` … |
-| 写文件 | `write` / `edit` / `create_file` … |
-| 搜索 | `glob` / `grep` / `file_search` … |
-| 派发子 agent | `task` / `agent` / `subagent` … |
+| 执行终端命令 (1) | `bash` / `shell` / `run_terminal_cmd` … |
+| 删除文件 (3) | `delete` / `rm` / `remove` … |
+| 列出文件 (4) | `glob` / `list` / `ls` / `file_search` … |
+| 内容搜索 (5) | `grep` / `glob` / `find_files` … |
+| 读文件 (8) | `read` / `view_file` / `cat` … |
+| 写文件 (12) | `write` / `edit` / `create_file` … |
+| 派发子 agent (19) | `task` / `agent` / `subagent` … |
+| 待办清单 (23) | 文本说明（参数结构复杂，不合成调用） |
+| 抓取网页 (37) | `webfetch` / `fetch` / `read_url` … |
 
 文本协议作为补充，覆盖上游没有内置对应物的自定义工具。
 用 `NATIVE_TOOL_BRIDGE=off` 可关闭桥接。
+
+**遇到没映射的工具怎么办**：未识别的工具不会被静默丢弃——服务端日志会打印
+`未识别的上游工具：参数容器字段 N`，同时客户端会收到一句说明文本而不是空回复。
+拿到字段号后用 `AGENT_FRAME_DEBUG=1` 抓帧看它的参数结构，补进
+`internal/cursor/agent.go` 的工具表与 `internal/tools/bridge.go` 的映射表即可。
 
 实测（OpenCode 完成「创建文件 → 运行 → 汇报输出」）：
 

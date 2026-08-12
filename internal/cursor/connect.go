@@ -39,6 +39,17 @@ const (
 	ToolWriteFile NativeToolKind = "write_file"
 	// ToolTask 派发一个子 agent 去完成子任务。
 	ToolTask NativeToolKind = "task"
+	// ToolDeleteFile 删除文件。
+	ToolDeleteFile NativeToolKind = "delete_file"
+	// ToolListFiles 按 glob 列出文件。
+	ToolListFiles NativeToolKind = "list_files"
+	// ToolFetchURL 抓取网页。
+	ToolFetchURL NativeToolKind = "fetch_url"
+	// ToolTodoWrite 记录待办清单。
+	ToolTodoWrite NativeToolKind = "todo_write"
+	// ToolUnknown 是尚未识别的上游工具。保留它是为了不让对话静默中断——
+	// 未映射的工具会以说明文本告知客户端，并在日志里打出字段号便于补齐。
+	ToolUnknown NativeToolKind = "unknown"
 )
 
 // NativeToolCall 是上游发来的一次内置工具调用请求。
@@ -53,7 +64,10 @@ type NativeToolCall struct {
 	Pattern     string // ToolSearchFiles
 	Content     string // ToolWriteFile
 	Prompt      string // ToolTask
+	URL         string // ToolFetchURL
 	Description string
+	// Field 是未识别工具在参数容器里的字段号，用于日志排查与后续补齐。
+	Field int
 }
 
 // StreamEvent 是对话流里产出的单个事件。

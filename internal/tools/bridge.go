@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -28,6 +29,16 @@ const (
 	KindWriteFile NativeKind = "write_file"
 	// KindTask 派发子 agent。
 	KindTask NativeKind = "task"
+	// KindDeleteFile 删除文件。
+	KindDeleteFile NativeKind = "delete_file"
+	// KindListFiles 按 glob 列出文件。
+	KindListFiles NativeKind = "list_files"
+	// KindFetchURL 抓取网页。
+	KindFetchURL NativeKind = "fetch_url"
+	// KindTodoWrite 记录待办清单。
+	KindTodoWrite NativeKind = "todo_write"
+	// KindUnknown 尚未识别的上游工具。
+	KindUnknown NativeKind = "unknown"
 )
 
 // Native 是归一化后的上游内置工具调用。
@@ -39,7 +50,9 @@ type Native struct {
 	Pattern     string
 	Content     string
 	Prompt      string
+	URL         string
 	Description string
+	Field       int
 }
 
 // 各类内置工具在客户端侧的候选名称，按优先级排列。
@@ -62,6 +75,18 @@ var candidateNames = map[NativeKind][]string{
 	KindTask: {
 		"task", "agent", "subagent", "dispatch_agent", "delegate",
 	},
+	KindDeleteFile: {
+		"delete", "delete_file", "remove", "rm", "removefile",
+	},
+	KindListFiles: {
+		"glob", "list", "ls", "list_dir", "list_files", "find_files", "file_search",
+	},
+	KindFetchURL: {
+		"webfetch", "web_fetch", "fetch", "read_url", "url_fetch", "browse", "http_get",
+	},
+	KindTodoWrite: {
+		"todowrite", "todo_write", "todos", "task_list", "update_plan",
+	},
 }
 
 // 参数名候选：把上游的值填进客户端 schema 里对应的属性。
@@ -71,11 +96,18 @@ var candidateParams = map[NativeKind][]string{
 	KindSearchFiles: {"pattern", "glob", "query", "globPattern", "path"},
 	KindWriteFile:   {"filePath", "file_path", "path", "target_file", "filename", "file"},
 	KindTask:        {"prompt", "task", "instructions", "input", "message"},
+	KindDeleteFile:  {"filePath", "file_path", "path", "target_file", "filename", "file"},
+	KindListFiles:   {"pattern", "glob", "globPattern", "path", "directory", "dir"},
+	KindFetchURL:    {"url", "uri", "link", "address"},
 }
 
 // MapNative 把一次上游内置调用映射成客户端声明的工具调用。
 // 找不到合适的客户端工具时返回 false，调用方应回退到文本描述。
 func MapNative(n Native, defs []Definition) (Call, bool) {
+	// 待办与未知工具没有稳妥的参数可合成，交给文本兜底
+	if n.Kind == KindUnknown || n.Kind == KindTodoWrite {
+		return Call{}, false
+	}
 	def, ok := matchTool(n.Kind, defs)
 	if !ok {
 		return Call{}, false
@@ -85,10 +117,12 @@ func MapNative(n Native, defs []Definition) (Call, bool) {
 	switch n.Kind {
 	case KindRunTerminal:
 		value = n.Command
-	case KindSearchFiles:
+	case KindSearchFiles, KindListFiles:
 		value = n.Pattern
 	case KindTask:
 		value = n.Prompt
+	case KindFetchURL:
+		value = n.URL
 	default:
 		value = n.Path
 	}
@@ -258,6 +292,17 @@ func DescribeNative(n Native) string {
 		return "（上游请求写入文件：" + n.Path + "）"
 	case KindTask:
 		return "（上游请求派发子任务：" + n.Description + "）"
+	case KindDeleteFile:
+		return "（上游请求删除文件：" + n.Path + "）"
+	case KindListFiles:
+		return "（上游请求列出文件：" + n.Pattern + "）"
+	case KindFetchURL:
+		return "（上游请求抓取网页：" + n.URL + "）"
+	case KindTodoWrite:
+		return "（上游更新了待办清单：" + n.Description + "）"
+	case KindUnknown:
+		return fmt.Sprintf("（上游请求了本代理尚未支持的工具 #%d，已跳过。"+
+			"如需支持请带上此编号反馈）", n.Field)
 	}
 	return ""
 }

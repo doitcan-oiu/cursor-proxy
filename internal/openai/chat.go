@@ -412,11 +412,21 @@ func toNative(c *cursor.NativeToolCall) tools.Native {
 		kind = tools.KindWriteFile
 	case cursor.ToolTask:
 		kind = tools.KindTask
+	case cursor.ToolDeleteFile:
+		kind = tools.KindDeleteFile
+	case cursor.ToolListFiles:
+		kind = tools.KindListFiles
+	case cursor.ToolFetchURL:
+		kind = tools.KindFetchURL
+	case cursor.ToolTodoWrite:
+		kind = tools.KindTodoWrite
+	case cursor.ToolUnknown:
+		kind = tools.KindUnknown
 	}
 	return tools.Native{
 		ID: c.ID, Kind: kind, Path: c.Path, Command: c.Command,
 		Pattern: c.Pattern, Content: c.Content, Prompt: c.Prompt,
-		Description: c.Description,
+		URL: c.URL, Description: c.Description, Field: c.Field,
 	}
 }
 

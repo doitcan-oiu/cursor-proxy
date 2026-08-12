@@ -186,6 +186,81 @@ func TestParseNativeTask(t *testing.T) {
 	}
 }
 
+func TestParseNativeOtherTools(t *testing.T) {
+	cases := []struct {
+		name      string
+		toolField int
+		build     func(*proto.Writer)
+		check     func(*testing.T, NativeToolCall)
+	}{
+		{
+			"删除文件", toolDeleteFile,
+			func(w *proto.Writer) { w.Str(1, "/tmp/x.txt") },
+			func(t *testing.T, c NativeToolCall) {
+				if c.Kind != ToolDeleteFile || c.Path != "/tmp/x.txt" {
+					t.Fatalf("%+v", c)
+				}
+			},
+		},
+		{
+			// 这个工具的模式在子字段 2，与搜索不同，最容易写错
+			"列出文件", toolListFiles,
+			func(w *proto.Writer) { w.Str(2, "internal/**/*.go") },
+			func(t *testing.T, c NativeToolCall) {
+				if c.Kind != ToolListFiles || c.Pattern != "internal/**/*.go" {
+					t.Fatalf("%+v", c)
+				}
+			},
+		},
+		{
+			"抓取网页", toolFetchURL,
+			func(w *proto.Writer) { w.Str(1, "https://example.com") },
+			func(t *testing.T, c NativeToolCall) {
+				if c.Kind != ToolFetchURL || c.URL != "https://example.com" {
+					t.Fatalf("%+v", c)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := proto.NewWriter()
+			tc.build(args)
+			var data []byte
+			data = append(data, toolCallFrame("toolu_x", tc.toolField, args)...)
+			data = append(data, conversationFrame(4)...)
+
+			calls := collectTools(t, data)
+			if len(calls) != 1 {
+				t.Fatalf("应解析出 1 个调用，得到 %+v", calls)
+			}
+			tc.check(t, calls[0])
+		})
+	}
+}
+
+// 未识别的工具必须报出来而不是丢弃，否则对话会静默中断且无从排查。
+func TestParseNativeUnknownToolIsReported(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "some payload")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_u", 99, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 {
+		t.Fatalf("未知工具也应产出事件，得到 %+v", calls)
+	}
+	if calls[0].Kind != ToolUnknown {
+		t.Fatalf("类型 = %v，期望 %v", calls[0].Kind, ToolUnknown)
+	}
+	if calls[0].Field != 99 {
+		t.Fatalf("应带上字段号便于补齐，得到 %d", calls[0].Field)
+	}
+}
+
 // 同一次调用会先后出现多个帧，必须按调用 id 去重，否则客户端会重复执行。
 func TestNativeToolCallDeduplicatedByID(t *testing.T) {
 	args := proto.NewWriter()
