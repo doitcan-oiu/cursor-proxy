@@ -68,6 +68,8 @@ type NativeToolCall struct {
 	Description string
 	// Field 是未识别工具在参数容器里的字段号，用于日志排查与后续补齐。
 	Field int
+	// Raw 是未识别工具的原始参数字节，留档供补映射时复核。
+	Raw []byte
 }
 
 // StreamEvent 是对话流里产出的单个事件。

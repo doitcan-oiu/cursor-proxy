@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import {
   ActivityIcon,
@@ -10,16 +10,36 @@ import {
   LogOutIcon,
   MenuIcon,
   MessagesSquareIcon,
+  PuzzleIcon,
   UsersRoundIcon,
   XIcon,
 } from '@lucide/vue'
 import { Button } from '@/components/ui/button'
 import StatusDot from '@/components/app/StatusDot.vue'
 import { useAuth } from '@/composables/useAuth'
+import { api } from '@/lib/api'
 
 const { info, logout } = useAuth()
 const route = useRoute()
 const drawerOpen = ref(false)
+
+// 未识别工具数量做成角标：出问题时能第一时间被看到
+const unknownCount = ref(0)
+let timer: number | undefined
+
+async function pollUnknown() {
+  try {
+    unknownCount.value = (await api.unknownTools.list()).length
+  } catch {
+    /* 静默 */
+  }
+}
+
+onMounted(() => {
+  pollUnknown()
+  timer = window.setInterval(pollUnknown, 15000)
+})
+onUnmounted(() => window.clearInterval(timer))
 
 const nav = [
   { to: '/', label: '概览', icon: GaugeIcon },
@@ -29,6 +49,7 @@ const nav = [
   { to: '/playground', label: '调试台', icon: MessagesSquareIcon },
   { to: '/network', label: '出口网络', icon: GlobeIcon },
   { to: '/logs', label: '请求日志', icon: ActivityIcon },
+  { to: '/unknown-tools', label: '未识别工具', icon: PuzzleIcon, badge: () => unknownCount.value },
 ]
 
 function isActive(to: string) {
@@ -73,7 +94,13 @@ function isActive(to: string) {
             ]"
           >
             <component :is="item.icon" class="size-4 shrink-0" />
-            {{ item.label }}
+            <span class="flex-1">{{ item.label }}</span>
+            <span
+              v-if="item.badge && item.badge() > 0"
+              class="rounded-full bg-brand-coral px-1.5 py-0.5 text-[11px] font-semibold leading-none text-white tabular"
+            >
+              {{ item.badge() }}
+            </span>
           </RouterLink>
         </nav>
 

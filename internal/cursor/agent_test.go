@@ -78,7 +78,7 @@ func collectTools(t *testing.T, data []byte) []NativeToolCall {
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events)
+	go pumpAgentStream(ctx, body, events, "test-model")
 
 	var out []NativeToolCall
 	for ev := range events {
@@ -323,7 +323,7 @@ func TestStreamEndsAfterConversationRecordWriteback(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events)
+	go pumpAgentStream(ctx, body, events, "test-model")
 
 	var text string
 	var sawEnd bool
@@ -376,7 +376,7 @@ func TestStreamEndsWhenOnlyThinkingProduced(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events)
+	go pumpAgentStream(ctx, body, events, "test-model")
 
 	var sawEnd bool
 	for ev := range events {
@@ -408,7 +408,7 @@ func TestHeartbeatFramesProduceNoEvents(t *testing.T) {
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events)
+	go pumpAgentStream(ctx, body, events, "test-model")
 
 	var text string
 	deltas := 0
@@ -438,7 +438,7 @@ func TestStreamEndsImmediatelyOnEndOfStreamFrame(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events)
+	go pumpAgentStream(ctx, body, events, "test-model")
 
 	var text string
 	var sawEnd bool
@@ -474,7 +474,7 @@ func TestStreamEndsOnUpstreamClose(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events)
+	go pumpAgentStream(ctx, body, events, "test-model")
 
 	var text string
 	for ev := range events {
@@ -497,7 +497,7 @@ func TestStreamStopsOnContextCancel(t *testing.T) {
 
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
-	go pumpAgentStream(ctx, body, events)
+	go pumpAgentStream(ctx, body, events, "test-model")
 
 	// 读到正文后取消
 	<-events

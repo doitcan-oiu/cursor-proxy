@@ -8,6 +8,12 @@ const routes: RouteRecordRaw[] = [
   { path: '/playground', name: 'playground', component: () => import('@/views/PlaygroundView.vue'), meta: { title: '调试台' } },
   { path: '/network', name: 'network', component: () => import('@/views/NetworkView.vue'), meta: { title: '出口网络' } },
   { path: '/logs', name: 'logs', component: () => import('@/views/LogsView.vue'), meta: { title: '请求日志' } },
+  {
+    path: '/unknown-tools',
+    name: 'unknown-tools',
+    component: () => import('@/views/UnknownToolsView.vue'),
+    meta: { title: '未识别工具' },
+  },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 

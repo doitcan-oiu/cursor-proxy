@@ -16,6 +16,7 @@ import (
 	"cursor-proxy/internal/config"
 	"cursor-proxy/internal/httpx"
 	"cursor-proxy/internal/proto"
+	"cursor-proxy/internal/toollog"
 	"cursor-proxy/internal/types"
 )
 
@@ -181,11 +182,11 @@ func StreamAgent(messages []types.Message, modelID, token, proxyURL string) (*Ag
 	}
 
 	events := make(chan StreamEvent, 32)
-	go pumpAgentStream(ctx, resp.Body, events)
+	go pumpAgentStream(ctx, resp.Body, events, modelID)
 	return &AgentStream{Events: events, cancel: cancel}, nil
 }
 
-func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent) {
+func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent, model string) {
 	defer close(events)
 	defer body.Close()
 
@@ -226,7 +227,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 	}()
 
 	var buffer []byte
-	var state agentStreamState
+	state := agentStreamState{model: model}
 
 	send := func(ev StreamEvent) bool {
 		select {
@@ -431,6 +432,7 @@ func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
 			return &NativeToolCall{
 				Kind: ToolUnknown, ID: id, Field: field,
 				Description: firstStringDeep(body, 3),
+				Raw:         body,
 			}
 		}
 	}
@@ -491,6 +493,8 @@ type agentStreamState struct {
 	sawToolCall bool
 	// emitted 按调用 id 去重：同一次调用会先后出现「进行中」与「完成」多个帧。
 	emitted map[string]bool
+	// model 仅用于给未识别工具的记录标注来源模型。
+	model string
 }
 
 // process 消费缓冲里完整的帧，返回是否遇到协议级结束帧。
@@ -552,7 +556,9 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				s.sawToolCall = true
 				if call.Kind == ToolUnknown {
 					log.Printf("[cursor] 未识别的上游工具：参数容器字段 %d（线索: %q）。"+
-						"请用 AGENT_FRAME_DEBUG=1 抓帧后补充映射。", call.Field, trunc(call.Description, 80))
+						"详情已记录到管理界面「未识别工具」页。", call.Field, trunc(call.Description, 80))
+					toollog.Record(call.Field, s.model, call.ID,
+						call.Description, describeDeep(call.Raw, 5), call.Raw)
 				}
 				send(StreamEvent{Kind: EventToolCall, Tool: call})
 				continue

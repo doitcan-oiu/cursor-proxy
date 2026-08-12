@@ -10,6 +10,7 @@ import (
 	"cursor-proxy/internal/config"
 	"cursor-proxy/internal/manage"
 	"cursor-proxy/internal/openai"
+	"cursor-proxy/internal/toollog"
 )
 
 var bearerRe = regexp.MustCompile(`(?i)^Bearer\s+`)
@@ -153,6 +154,15 @@ func manageHandler() http.Handler {
 
 	mux.HandleFunc("GET /manage/models", func(w http.ResponseWriter, r *http.Request) {
 		openai.WriteJSON(w, 200, manage.ListModels())
+	})
+
+	// 未识别的上游工具：供界面展示与导出
+	mux.HandleFunc("GET /manage/unknown-tools", func(w http.ResponseWriter, r *http.Request) {
+		openai.WriteJSON(w, 200, toollog.List())
+	})
+	mux.HandleFunc("POST /manage/unknown-tools/clear", func(w http.ResponseWriter, r *http.Request) {
+		toollog.Clear()
+		openai.WriteJSON(w, 200, map[string]any{"ok": true})
 	})
 
 	mux.HandleFunc("POST /manage/chat/test", func(w http.ResponseWriter, r *http.Request) {

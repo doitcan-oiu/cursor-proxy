@@ -114,6 +114,18 @@ export interface VpnStatus {
   nodes: VpnNode[]
 }
 
+export interface UnknownTool {
+  id: number
+  time: number
+  field: number
+  model: string
+  callId?: string
+  hint?: string
+  structure?: string
+  rawBase64?: string
+  count: number
+}
+
 export interface TestChatResult {
   ok: boolean
   text: string
@@ -216,6 +228,11 @@ export const api = {
   logs: {
     get: (since = 0) => request<LogsPayload>(`/manage/logs?since=${since}`),
     clear: () => post<{ ok: boolean }>('/manage/logs/clear'),
+  },
+
+  unknownTools: {
+    list: async () => (await request<UnknownTool[]>('/manage/unknown-tools')) ?? [],
+    clear: () => post<{ ok: boolean }>('/manage/unknown-tools/clear'),
   },
 
   vpn: {
