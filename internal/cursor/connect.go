@@ -1,0 +1,122 @@
+package cursor
+
+import (
+	"bytes"
+	"compress/gzip"
+	"encoding/binary"
+	"encoding/json"
+	"io"
+	"strings"
+
+	"cursor-proxy/internal/proto"
+)
+
+// StreamEventKind 标识流事件类型。
+type StreamEventKind int
+
+const (
+	// EventDelta 增量内容。
+	EventDelta StreamEventKind = iota
+	// EventError 流内错误。
+	EventError
+	// EventEnd 流正常结束。
+	EventEnd
+)
+
+// StreamEvent 是对话流里产出的单个事件。
+type StreamEvent struct {
+	Kind     StreamEventKind
+	Text     string
+	Thinking string
+	Message  string
+}
+
+func gzipBytes(b []byte) []byte {
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	_, _ = w.Write(b)
+	_ = w.Close()
+	return buf.Bytes()
+}
+
+func gunzipBytes(b []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+// EncodeConnectEnvelope 把 protobuf 主体封装为 Connect 信封：[flag:1][len:4 BE][payload]。
+func EncodeConnectEnvelope(body []byte, compress bool) []byte {
+	payload := body
+	flag := byte(0x00)
+	if compress {
+		payload = gzipBytes(body)
+		flag = 0x01
+	}
+	header := make([]byte, 5)
+	header[0] = flag
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	return append(header, payload...)
+}
+
+// FrameDecoder 是有状态的 Connect 帧解码器，跨 chunk 缓冲，逐帧产出事件。
+// flag 0/1: protobuf(可 gzip)；flag 2/3: JSON(可 gzip，一般是状态/错误)。
+type FrameDecoder struct {
+	buffer []byte
+}
+
+// Push 喂入一段网络字节，返回本次可解出的事件。
+func (d *FrameDecoder) Push(chunk []byte) []StreamEvent {
+	d.buffer = append(d.buffer, chunk...)
+	var events []StreamEvent
+
+	for len(d.buffer) >= 5 {
+		flag := d.buffer[0]
+		length := binary.BigEndian.Uint32(d.buffer[1:5])
+		if uint32(len(d.buffer)) < 5+length {
+			break
+		}
+		payload := d.buffer[5 : 5+length]
+		d.buffer = d.buffer[5+length:]
+		if length == 0 {
+			continue
+		}
+
+		switch {
+		case flag == 0x00 || flag == 0x01:
+			raw := payload
+			if flag == 0x01 {
+				var err error
+				if raw, err = gunzipBytes(payload); err != nil {
+					events = append(events, StreamEvent{Kind: EventError, Message: "frame decode failed: " + err.Error()})
+					continue
+				}
+			}
+			dec := proto.DecodeChatResponse(raw)
+			if dec.Text != "" || dec.Thinking != "" {
+				events = append(events, StreamEvent{Kind: EventDelta, Text: dec.Text, Thinking: dec.Thinking})
+			}
+		case flag == 0x02 || flag == 0x03:
+			raw := payload
+			if flag == 0x03 {
+				var err error
+				if raw, err = gunzipBytes(payload); err != nil {
+					continue
+				}
+			}
+			utf := strings.TrimSpace(string(raw))
+			if utf != "" && utf != "{}" {
+				var probe map[string]json.RawMessage
+				if json.Unmarshal([]byte(utf), &probe) == nil {
+					if _, ok := probe["error"]; ok {
+						events = append(events, StreamEvent{Kind: EventError, Message: utf})
+					}
+				}
+			}
+		}
+	}
+	return events
+}

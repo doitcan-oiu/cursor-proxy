@@ -1,0 +1,10 @@
+/.data/
+/cursor-proxy
+*.log
+
+# 前端依赖
+webui/node_modules/
+webui/.vite/
+
+# 注意：internal/webui/dist 是被 go:embed 打进二进制的界面产物，
+# 需要随仓库提交，否则 clone 后无法直接 go build。用 `make ui` 重新生成。
