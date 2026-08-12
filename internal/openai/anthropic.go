@@ -13,12 +13,20 @@ import (
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/reqlog"
 	"cursor-proxy/internal/tokenize"
+	"cursor-proxy/internal/tools"
 	"cursor-proxy/internal/types"
 )
 
 type anthropicBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	// tool_use
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+	// tool_result
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"`
 }
 
 type anthropicMessage struct {
@@ -26,13 +34,63 @@ type anthropicMessage struct {
 	Content json.RawMessage `json:"content"`
 }
 
-type anthropicBody struct {
-	Model    string             `json:"model"`
-	System   json.RawMessage    `json:"system"`
-	Messages []anthropicMessage `json:"messages"`
-	Stream   bool               `json:"stream"`
+type anthropicTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
 }
 
+type anthropicBody struct {
+	Model      string             `json:"model"`
+	System     json.RawMessage    `json:"system"`
+	Messages   []anthropicMessage `json:"messages"`
+	Stream     bool               `json:"stream"`
+	Tools      []anthropicTool    `json:"tools"`
+	ToolChoice json.RawMessage    `json:"tool_choice"`
+}
+
+func (b anthropicBody) toolDefs() []tools.Definition {
+	defs := make([]tools.Definition, 0, len(b.Tools))
+	for _, t := range b.Tools {
+		if t.Name == "" {
+			continue
+		}
+		defs = append(defs, tools.Definition{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.InputSchema,
+		})
+	}
+	return defs
+}
+
+// toolChoice 解析 Anthropic 的 tool_choice：{"type":"auto"|"any"|"none"|"tool","name":"x"}。
+func (b anthropicBody) toolChoice() tools.Choice {
+	if len(b.ToolChoice) == 0 {
+		return tools.Choice{Mode: "auto"}
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(b.ToolChoice, &obj) != nil {
+		return tools.Choice{Mode: "auto"}
+	}
+	switch obj.Type {
+	case "none":
+		return tools.Choice{Mode: "none"}
+	case "any":
+		return tools.Choice{Mode: "required"}
+	case "tool":
+		if obj.Name != "" {
+			return tools.Choice{Mode: "function", Name: obj.Name}
+		}
+	}
+	return tools.Choice{Mode: "auto"}
+}
+
+// blocksToText 把内容块拍平成文本；tool_use / tool_result 会被还原成
+// 与提示词协议一致的形式，让模型看得懂上一轮发生了什么。
 func blocksToText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -42,16 +100,31 @@ func blocksToText(raw json.RawMessage) string {
 		return s
 	}
 	var blocks []anthropicBlock
-	if json.Unmarshal(raw, &blocks) == nil {
-		var sb strings.Builder
-		for _, b := range blocks {
-			if b.Type == "text" || b.Text != "" {
-				sb.WriteString(b.Text)
-			}
-		}
-		return sb.String()
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
 	}
-	return ""
+	var sb strings.Builder
+	for _, b := range blocks {
+		switch b.Type {
+		case "tool_use":
+			args := "{}"
+			if len(b.Input) > 0 {
+				args = string(b.Input)
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(tools.RenderCall(tools.Call{ID: b.ID, Name: b.Name, Arguments: args}))
+		case "tool_result":
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(fmt.Sprintf("[tool result %s] %s", b.ToolUseID, blocksToText(b.Content)))
+		default:
+			sb.WriteString(b.Text)
+		}
+	}
+	return sb.String()
 }
 
 func anthropicToInternal(body anthropicBody) []types.Message {
@@ -93,6 +166,9 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, 400, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": "messages required"}})
 		return
 	}
+
+	toolDefs := body.toolDefs()
+	messages = injectToolPrompt(messages, toolDefs, body.toolChoice())
 
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	startedAt := time.Now()
@@ -145,17 +221,53 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		send("content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
 		send("ping", map[string]any{"type": "ping"})
 
+		var scanner *tools.Scanner
+		if len(toolDefs) > 0 {
+			scanner = &tools.Scanner{}
+		}
+		emitText := func(text string) {
+			if text == "" {
+				return
+			}
+			content.WriteString(text)
+			send("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": text}})
+		}
+
 		for ev := range events {
 			if ev.Kind == cursor.EventDelta && ev.Text != "" {
-				content.WriteString(ev.Text)
-				send("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": ev.Text}})
+				if scanner != nil {
+					emitText(scanner.Push(ev.Text))
+				} else {
+					emitText(ev.Text)
+				}
 			} else if ev.Kind == cursor.EventError {
 				errored = true
 				errMsg = ev.Message
 			}
 		}
-		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+
 		stopReason := "end_turn"
+		if scanner != nil {
+			emitText(scanner.Flush())
+		}
+		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+
+		// 工具调用各占一个 tool_use 内容块，紧跟在文本块之后。
+		if scanner != nil {
+			for i, c := range scanner.Calls() {
+				idx := i + 1
+				send("content_block_start", map[string]any{
+					"type": "content_block_start", "index": idx,
+					"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": map[string]any{}},
+				})
+				send("content_block_delta", map[string]any{
+					"type": "content_block_delta", "index": idx,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Arguments},
+				})
+				send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+				stopReason = "tool_use"
+			}
+		}
 		if errored {
 			stopReason = "error"
 		}
@@ -187,7 +299,15 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			lastError = ev.Message
 		}
 	}
-	if content == "" && lastError != "" {
+
+	var toolCalls []tools.Call
+	if len(toolDefs) > 0 {
+		var scanner tools.Scanner
+		content = scanner.Push(content) + scanner.Flush()
+		toolCalls = scanner.Calls()
+	}
+
+	if content == "" && len(toolCalls) == 0 && lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(), Error: trunc(lastError, 200)})
@@ -200,10 +320,29 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
 		Stream: false, Status: "ok", Ms: time.Since(startedAt).Milliseconds(),
 		Chars: utf8.RuneCountInString(content), Tokens: outputTokens})
+	blocks := []map[string]any{}
+	if content != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": content})
+	}
+	stopReason := "end_turn"
+	for _, c := range toolCalls {
+		var input any = map[string]any{}
+		if json.Unmarshal([]byte(c.Arguments), &input) != nil {
+			input = map[string]any{}
+		}
+		blocks = append(blocks, map[string]any{
+			"type": "tool_use", "id": c.ID, "name": c.Name, "input": input,
+		})
+		stopReason = "tool_use"
+	}
+	if len(blocks) == 0 {
+		blocks = append(blocks, map[string]any{"type": "text", "text": ""})
+	}
+
 	WriteJSON(w, 200, map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": model,
-		"content":       []map[string]any{{"type": "text", "text": content}},
-		"stop_reason":   "end_turn",
+		"content":       blocks,
+		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage":         map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
 	})

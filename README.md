@@ -82,6 +82,22 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 
 鉴权：OpenAI 用 `Authorization: Bearer sk-...`；Anthropic 用 `x-api-key: sk-...`。
 
+### 关于工具调用（function calling）
+
+支持 OpenAI 的 `tools` / `tool_calls` 与 Anthropic 的 `tools` / `tool_use`，
+流式与非流式都可用，因此能对接 OpenCode 这类需要工具调用的 agent 客户端。
+
+实现方式是**提示词模拟**而非协议透传，原因是上游不具备这个能力：Cursor 的 agent
+端点用 protobuf 字段号标识自己内置的工具（如字段 7 = 读文件），协议里没有任何位置
+能承载客户端声明的具名函数与 JSON Schema。
+
+所以这里把客户端声明的工具写进提示词，约定模型用 `<tool_call>` 标签输出调用意图，
+再从输出流里剥离该标签、还原成标准的 `tool_calls` / `tool_use`。要注意：
+
+- 可靠性取决于模型是否遵守输出格式，并行多工具调用比原生能力弱。
+- 标签解析失败时会把原文原样返回，不会静默吞掉内容。
+- 请求里没有 `tools` 字段时完全不注入，普通对话的行为不受任何影响。
+
 ### 关于 `usage`
 
 Cursor 上游不返回 token 用量，所以这里由本地计算，见 `internal/tokenize`：

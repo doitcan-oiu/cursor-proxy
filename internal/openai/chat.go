@@ -13,31 +13,130 @@ import (
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/reqlog"
 	"cursor-proxy/internal/tokenize"
+	"cursor-proxy/internal/tools"
 	"cursor-proxy/internal/types"
 )
 
-type rawMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+type rawToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
+type rawMessage struct {
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCalls  []rawToolCall   `json:"tool_calls"`
+	ToolCallID string          `json:"tool_call_id"`
+	Name       string          `json:"name"`
+}
+
+// parseMessages 把请求里的消息归一化成内部形态。
+// assistant 的 tool_calls 与 tool 角色的结果都会被还原成文本回放给模型，
+// 否则模型看不到自己上一轮调用了什么、拿到了什么结果。
 func parseMessages(raw []rawMessage) []types.Message {
 	out := make([]types.Message, 0, len(raw))
 	for _, m := range raw {
 		var content any
-		_ = json.Unmarshal(m.Content, &content)
-		out = append(out, types.Message{Role: m.Role, Content: content})
+		if len(m.Content) > 0 {
+			_ = json.Unmarshal(m.Content, &content)
+		}
+		text := types.ContentToText(content)
+
+		switch {
+		case len(m.ToolCalls) > 0:
+			var b strings.Builder
+			b.WriteString(text)
+			for _, tc := range m.ToolCalls {
+				if b.Len() > 0 {
+					b.WriteString("\n")
+				}
+				b.WriteString(tools.RenderCall(tools.Call{
+					ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
+				}))
+			}
+			out = append(out, types.Message{Role: "assistant", Content: b.String()})
+
+		case m.Role == "tool":
+			label := m.Name
+			if label == "" {
+				label = m.ToolCallID
+			}
+			body := text
+			if label != "" {
+				body = fmt.Sprintf("[%s] %s", label, text)
+			}
+			out = append(out, types.Message{Role: "tool", Content: body})
+
+		default:
+			out = append(out, types.Message{Role: m.Role, Content: content})
+		}
 	}
 	return out
 }
 
+type rawTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+	} `json:"function"`
+}
+
 type chatBody struct {
-	Model         string       `json:"model"`
-	Messages      []rawMessage `json:"messages"`
-	Stream        bool         `json:"stream"`
+	Model         string          `json:"model"`
+	Messages      []rawMessage    `json:"messages"`
+	Stream        bool            `json:"stream"`
+	Tools         []rawTool       `json:"tools"`
+	ToolChoice    json.RawMessage `json:"tool_choice"`
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
+}
+
+// toolDefs 把 OpenAI 的 tools 字段转成内部定义。
+func (b chatBody) toolDefs() []tools.Definition {
+	defs := make([]tools.Definition, 0, len(b.Tools))
+	for _, t := range b.Tools {
+		if t.Function.Name == "" {
+			continue
+		}
+		defs = append(defs, tools.Definition{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Parameters:  t.Function.Parameters,
+		})
+	}
+	return defs
+}
+
+// toolChoice 解析 tool_choice：可能是 "auto"/"none"/"required"，
+// 也可能是 {"type":"function","function":{"name":"x"}}。
+func (b chatBody) toolChoice() tools.Choice {
+	if len(b.ToolChoice) == 0 {
+		return tools.Choice{Mode: "auto"}
+	}
+	var s string
+	if json.Unmarshal(b.ToolChoice, &s) == nil {
+		if s == "" {
+			s = "auto"
+		}
+		return tools.Choice{Mode: s}
+	}
+	var obj struct {
+		Type     string `json:"type"`
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if json.Unmarshal(b.ToolChoice, &obj) == nil && obj.Function.Name != "" {
+		return tools.Choice{Mode: "function", Name: obj.Function.Name}
+	}
+	return tools.Choice{Mode: "auto"}
 }
 
 // usagePayload 组装 OpenAI 风格的 usage。token 数为估算值，见 internal/tokenize。
@@ -86,6 +185,10 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	messages := parseMessages(body.Messages)
+	// 声明了 tools 才注入工具提示词；普通对话完全不受影响。
+	toolDefs := body.toolDefs()
+	messages = injectToolPrompt(messages, toolDefs, body.toolChoice())
+
 	id := "chatcmpl-" + uuid.NewString()
 	startedAt := time.Now()
 	keyPrefix := keyPrefixFromAuth(r)
@@ -134,20 +237,33 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		errored := false
 		errMsg := ""
 		var content, reasoning strings.Builder
+		// 有工具时用 Scanner 边流边剥离调用标签，避免半截标签漏给客户端。
+		var scanner *tools.Scanner
+		if len(toolDefs) > 0 {
+			scanner = &tools.Scanner{}
+		}
+
+		emitText := func(text string) {
+			if text == "" {
+				return
+			}
+			content.WriteString(text)
+			writeSSE(sseChunk(id, body.Model, map[string]any{"content": text}, nil))
+		}
+
 		for ev := range events {
 			switch ev.Kind {
 			case cursor.EventDelta:
-				delta := map[string]any{}
-				if ev.Text != "" {
-					delta["content"] = ev.Text
-				}
 				if ev.Thinking != "" {
-					delta["reasoning_content"] = ev.Thinking
-				}
-				if ev.Text != "" || ev.Thinking != "" {
-					content.WriteString(ev.Text)
 					reasoning.WriteString(ev.Thinking)
-					writeSSE(sseChunk(id, body.Model, delta, nil))
+					writeSSE(sseChunk(id, body.Model, map[string]any{"reasoning_content": ev.Thinking}, nil))
+				}
+				if ev.Text != "" {
+					if scanner != nil {
+						emitText(scanner.Push(ev.Text))
+					} else {
+						emitText(ev.Text)
+					}
 				}
 			case cursor.EventError:
 				errored = true
@@ -156,7 +272,20 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeSSE("data: " + string(b) + "\n\n")
 			}
 		}
-		writeSSE(sseChunk(id, body.Model, map[string]any{}, "stop"))
+
+		finish := "stop"
+		if scanner != nil {
+			emitText(scanner.Flush())
+			if calls := scanner.Calls(); len(calls) > 0 {
+				for i, c := range calls {
+					writeSSE(sseChunk(id, body.Model, map[string]any{
+						"tool_calls": []map[string]any{toolCallDelta(i, c)},
+					}, nil))
+				}
+				finish = "tool_calls"
+			}
+		}
+		writeSSE(sseChunk(id, body.Model, map[string]any{}, finish))
 
 		// 按 OpenAI 规范：仅在 stream_options.include_usage 为真时补一个
 		// choices 为空、只带 usage 的收尾分片。
@@ -198,7 +327,14 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if content == "" && lastError != "" {
+	var toolCalls []tools.Call
+	if len(toolDefs) > 0 {
+		var scanner tools.Scanner
+		content = scanner.Push(content) + scanner.Flush()
+		toolCalls = scanner.Calls()
+	}
+
+	if content == "" && len(toolCalls) == 0 && lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(), Error: trunc(lastError, 200)})
@@ -216,14 +352,62 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if reasoning != "" {
 		message["reasoning_content"] = reasoning
 	}
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		list := make([]map[string]any, 0, len(toolCalls))
+		for _, c := range toolCalls {
+			list = append(list, map[string]any{
+				"id":       c.ID,
+				"type":     "function",
+				"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+			})
+		}
+		message["tool_calls"] = list
+		finishReason = "tool_calls"
+		// 只有工具调用没有正文时，按规范 content 应为 null
+		if content == "" {
+			message["content"] = nil
+		}
+	}
 	WriteJSON(w, 200, map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   body.Model,
-		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": "stop"}},
+		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": finishReason}},
 		"usage":   usagePayload(promptTokens, completionTokens),
 	})
+}
+
+// toolCallDelta 组装流式响应里的单个 tool_call 增量。
+// 我们只在标签闭合后才识别出完整调用，所以一次性给全 id/name/arguments。
+func toolCallDelta(index int, c tools.Call) map[string]any {
+	return map[string]any{
+		"index":    index,
+		"id":       c.ID,
+		"type":     "function",
+		"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+	}
+}
+
+// injectToolPrompt 把工具说明并入 system 提示。
+// 没有工具时原样返回，保证普通对话的行为完全不变。
+func injectToolPrompt(messages []types.Message, defs []tools.Definition, choice tools.Choice) []types.Message {
+	prompt := tools.BuildSystemPrompt(defs, choice)
+	if prompt == "" {
+		return messages
+	}
+	// 追加到已有的第一条 system 消息之后，避免打乱客户端自己的系统提示
+	for i, m := range messages {
+		if m.Role == "system" || m.Role == "developer" {
+			merged := strings.TrimSpace(types.ContentToText(m.Content)) + "\n\n" + prompt
+			out := make([]types.Message, len(messages))
+			copy(out, messages)
+			out[i] = types.Message{Role: m.Role, Content: merged}
+			return out
+		}
+	}
+	return append([]types.Message{{Role: "system", Content: prompt}}, messages...)
 }
 
 func statusOf(errored bool) string {
