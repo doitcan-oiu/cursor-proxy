@@ -25,8 +25,8 @@ func New() http.Handler {
 
 	// 对外接口：先过代理 Key 鉴权。
 	mux.Handle("GET /v1/models", proxyKeyAuth(http.HandlerFunc(openai.Models)))
-	mux.Handle("POST /v1/chat/completions", proxyKeyAuth(http.HandlerFunc(openai.ChatCompletions)))
-	mux.Handle("POST /v1/messages", proxyKeyAuth(http.HandlerFunc(openai.Messages)))
+	mux.Handle("POST /v1/chat/completions", proxyKeyAuth(withBodyDebug(http.HandlerFunc(openai.ChatCompletions))))
+	mux.Handle("POST /v1/messages", proxyKeyAuth(withBodyDebug(http.HandlerFunc(openai.Messages))))
 
 	// 管理接口。
 	mux.Handle("/admin/", admin.Handler())

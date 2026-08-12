@@ -98,6 +98,46 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 - 标签解析失败时会把原文原样返回，不会静默吞掉内容。
 - 请求里没有 `tools` 字段时完全不注入，普通对话的行为不受任何影响。
 
+**选模型很关键。** Cursor 自家的 agent 模型（`auto` / `default`、`composer-*`）在需要
+写文件、执行命令时会走它自己的原生工具链并直接结束轮次，只留下一句「我这就去创建…」，
+表现为客户端回一句就断开。部分新模型（实测 `claude-4.6-opus-max`、`gpt-5.1`）也有同样倾向。
+
+实测能稳定完成多步骤 agent 任务的是 **`claude-4.5-sonnet`**（连续 3 次创建文件并执行成功）。
+接 agent 客户端时优先选它，遇到「只说不做」就换模型。
+
+### 对接 OpenCode
+
+OpenCode 用 `@ai-sdk/anthropic` 走 `/v1/messages`。有个坑：**自定义模型默认不带工具能力**，
+必须显式写 `"tool_call": true`，否则 OpenCode 根本不会发送 `tools` 字段，
+模型没有工具可用，就会只回一句话然后结束。
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "cursorproxy": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "cursorproxy",
+      "options": {
+        "apiKey": "sk-你的代理密钥",
+        "baseURL": "http://127.0.0.1:3100/v1"
+      },
+      "models": {
+        "claude-4.5-sonnet": {
+          "name": "claude-4.5-sonnet",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": { "context": 200000, "output": 32000 }
+        }
+      }
+    }
+  }
+}
+```
+
+排查对接问题时用 `PROXY_DEBUG_BODY=1` 启动，可以看到客户端发来的完整请求体
+与我们返回的响应体（包括 SSE 事件流）。
+
 ### 关于 `usage`
 
 Cursor 上游不返回 token 用量，所以这里由本地计算，见 `internal/tokenize`：

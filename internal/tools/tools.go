@@ -66,8 +66,16 @@ func BuildSystemPrompt(defs []Definition, choice Choice) string {
 	b.WriteString("- \"arguments\" MUST be a JSON object matching the tool's schema (use {} if the tool takes none).\n")
 	b.WriteString("- Emit one block per call; emit several blocks to call several tools.\n")
 	b.WriteString("- Do NOT wrap the block in markdown code fences.\n")
-	b.WriteString("- Do NOT describe the call in prose — just emit the block and stop.\n")
 	b.WriteString("- Results come back as messages from the \"tool\" role; then continue the task.\n")
+	// 下面三条是关键：上游本身是个带原生工具的 agent，涉及文件/终端时它会倾向
+	// 走自己的原生工具路径并直接结束轮次，导致只留下一句「我这就去做…」。
+	// 必须明确否定它拥有内置能力，并禁止「宣告动作却不给出调用块」。
+	b.WriteString("- You have NO built-in tools and NO direct access to files, the terminal, or the network.\n")
+	b.WriteString("  Emitting a " + OpenTag + " block is the ONLY way you can take any action.\n")
+	b.WriteString("- NEVER announce an action and then stop. If you say you will do something,\n")
+	b.WriteString("  the SAME reply MUST contain the corresponding " + OpenTag + " block.\n")
+	b.WriteString("- If a task needs several steps, call the first tool now; you will be invoked again\n")
+	b.WriteString("  with the result and can continue from there.\n")
 
 	switch choice.Mode {
 	case "required":
@@ -98,6 +106,16 @@ func compactJSON(raw json.RawMessage) string {
 		return string(raw)
 	}
 	return out.String()
+}
+
+// Reminder 是追加到最后一条用户消息末尾的短提醒。
+//
+// 只放在 system 里不够：上游会在自己那 13KB 的 agent 提示词之后再拼接我们的内容，
+// 我们的规则离生成点较远，容易被它的原生行为盖过。末尾提醒利用近因效应，
+// 实测能显著降低「只宣告不调用」的概率。
+func Reminder() string {
+	return "\n\n[System reminder: you have no built-in tools. To act, emit a " +
+		OpenTag + " block in this reply; describing an action without the block does nothing.]"
 }
 
 // RenderCall 把一次工具调用还原成提示词里的标签形式，

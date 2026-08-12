@@ -390,24 +390,44 @@ func toolCallDelta(index int, c tools.Call) map[string]any {
 	}
 }
 
-// injectToolPrompt 把工具说明并入 system 提示。
+// injectToolPrompt 把工具说明并入 system 提示，并在最后一条用户消息末尾附一句提醒。
 // 没有工具时原样返回，保证普通对话的行为完全不变。
 func injectToolPrompt(messages []types.Message, defs []tools.Definition, choice tools.Choice) []types.Message {
 	prompt := tools.BuildSystemPrompt(defs, choice)
 	if prompt == "" {
 		return messages
 	}
-	// 追加到已有的第一条 system 消息之后，避免打乱客户端自己的系统提示
-	for i, m := range messages {
+
+	out := make([]types.Message, len(messages))
+	copy(out, messages)
+
+	// 工具说明追加到已有 system 之后，避免打乱客户端自己的系统提示
+	injected := false
+	for i, m := range out {
 		if m.Role == "system" || m.Role == "developer" {
-			merged := strings.TrimSpace(types.ContentToText(m.Content)) + "\n\n" + prompt
-			out := make([]types.Message, len(messages))
-			copy(out, messages)
-			out[i] = types.Message{Role: m.Role, Content: merged}
-			return out
+			out[i] = types.Message{
+				Role:    m.Role,
+				Content: strings.TrimSpace(types.ContentToText(m.Content)) + "\n\n" + prompt,
+			}
+			injected = true
+			break
 		}
 	}
-	return append([]types.Message{{Role: "system", Content: prompt}}, messages...)
+	if !injected {
+		out = append([]types.Message{{Role: "system", Content: prompt}}, out...)
+	}
+
+	// 末尾提醒：靠近生成点，压过上游自身 agent 提示词的影响
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i].Role == "user" {
+			out[i] = types.Message{
+				Role:    "user",
+				Content: types.ContentToText(out[i].Content) + tools.Reminder(),
+			}
+			break
+		}
+	}
+	return out
 }
 
 func statusOf(errored bool) string {
