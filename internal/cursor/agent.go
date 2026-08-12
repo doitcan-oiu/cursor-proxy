@@ -306,67 +306,76 @@ const (
 	fieldHeartbeat     = 13 // StreamMessage 内的心跳（约 10s 一次）
 )
 
-// fieldClientAction 内部按「哪个字段被设置」区分工具类型（逆向自实际报文）。
+// StreamMessage 里与工具调用相关的字段。
 const (
-	actionSearchFiles = 5  // { 3: glob 模式, 4: 输出模式, 14: 调用 id }
-	actionReadFile    = 7  // { 1: 路径, 2: 调用 id }
-	actionWriteFile   = 9  // { 1: 路径, 2: 内容, ...: 调用 id }
-	actionRunTerminal = 14 // { 1: 命令, 4: 调用 id, 15: 说明 }
+	smToolCallDone = 2 // 调用完成：{ 1: 调用 id, 2: 参数容器, 3: 消息 id }
 )
 
-// firstNonEmptyString 在候选字段里取第一个非空字符串，
-// 用于容忍不同工具把调用 id 放在不同字段号上。
-func firstNonEmptyString(f map[int][]proto.Field, fields ...int) string {
-	for _, n := range fields {
-		if s := proto.FirstString(f, n); s != "" {
-			return s
-		}
+// 参数容器内按「哪个字段被设置」区分工具类型，其值再套一层字段 1 才是真正的参数。
+// 例：2{12{1{1:"/a.py" 6:"内容"}}} 表示写文件。
+const (
+	toolRunTerminal = 1  // { 1: 命令, 5: 简称, 15: 说明 }
+	toolSearchFiles = 5  // { 1: 查询串, 4: 输出模式 }
+	toolReadFile    = 8  // { 1: 路径 }
+	toolWriteFile   = 12 // { 1: 路径, 6: 内容 }
+)
+
+// parseNativeToolCall 从「工具调用完成」帧里解出内置工具调用。
+//
+// 必须从这里取而不是顶层的「客户端动作」帧：动作帧只带路径这类摘要信息
+// （例如写文件的动作帧只有路径没有内容），据此还原会得到错误的调用。
+func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
+	done := proto.FirstBytes(sm, smToolCallDone)
+	if done == nil {
+		return nil
 	}
-	return ""
-}
+	f := proto.Decode(done)
+	id := proto.FirstString(f, 1)
+	wrapper := proto.FirstBytes(f, 2)
+	if wrapper == nil {
+		return nil
+	}
+	w := proto.Decode(wrapper)
 
-// parseNativeToolCall 从「客户端动作」帧里解出内置工具调用。
-func parseNativeToolCall(action []byte) *NativeToolCall {
-	fields := proto.Decode(action)
-
-	if body := proto.FirstBytes(fields, actionReadFile); body != nil {
-		f := proto.Decode(body)
-		if path := proto.FirstString(f, 1); path != "" {
-			return &NativeToolCall{Kind: ToolReadFile, Path: path, ID: proto.FirstString(f, 2)}
+	// args 取出某个工具字段下再套一层字段 1 的参数对象
+	args := func(toolField int) map[int][]proto.Field {
+		body := proto.FirstBytes(w, toolField)
+		if body == nil {
+			return nil
 		}
+		inner := proto.FirstBytes(proto.Decode(body), 1)
+		if inner == nil {
+			return nil
+		}
+		return proto.Decode(inner)
 	}
 
-	if body := proto.FirstBytes(fields, actionRunTerminal); body != nil {
-		f := proto.Decode(body)
-		if cmd := proto.FirstString(f, 1); cmd != "" {
+	if a := args(toolWriteFile); a != nil {
+		if path := proto.FirstString(a, 1); path != "" {
 			return &NativeToolCall{
-				Kind: ToolRunTerminal, Command: cmd,
-				ID: proto.FirstString(f, 4), Description: proto.FirstString(f, 15),
+				Kind: ToolWriteFile, ID: id,
+				Path: path, Content: proto.FirstString(a, 6),
 			}
 		}
 	}
-
-	if body := proto.FirstBytes(fields, actionSearchFiles); body != nil {
-		f := proto.Decode(body)
-		if pattern := firstNonEmptyString(f, 3, 1, 2); pattern != "" {
+	if a := args(toolReadFile); a != nil {
+		if path := proto.FirstString(a, 1); path != "" {
+			return &NativeToolCall{Kind: ToolReadFile, ID: id, Path: path}
+		}
+	}
+	if a := args(toolRunTerminal); a != nil {
+		if cmd := proto.FirstString(a, 1); cmd != "" {
 			return &NativeToolCall{
-				Kind: ToolSearchFiles, Pattern: pattern,
-				ID: firstNonEmptyString(f, 14, 4, 2),
+				Kind: ToolRunTerminal, ID: id,
+				Command: cmd, Description: proto.FirstString(a, 15),
 			}
 		}
 	}
-
-	if body := proto.FirstBytes(fields, actionWriteFile); body != nil {
-		f := proto.Decode(body)
-		if path := proto.FirstString(f, 1); path != "" {
-			return &NativeToolCall{
-				Kind: ToolWriteFile, Path: path,
-				Content: proto.FirstString(f, 2),
-				ID:      firstNonEmptyString(f, 3, 4, 14),
-			}
+	if a := args(toolSearchFiles); a != nil {
+		if q := proto.FirstString(a, 1); q != "" {
+			return &NativeToolCall{Kind: ToolSearchFiles, ID: id, Pattern: q}
 		}
 	}
-
 	return nil
 }
 
@@ -382,6 +391,8 @@ type agentStreamState struct {
 	// sawToolCall 表示本轮下发过内置工具调用。此时即便没有正文也是正常结果，
 	// 不应被上层当成空响应而重试。
 	sawToolCall bool
+	// emitted 按调用 id 去重：同一次调用会先后出现「进行中」与「完成」多个帧。
+	emitted map[string]bool
 }
 
 // process 消费缓冲里完整的帧，返回是否遇到协议级结束帧。
@@ -433,15 +444,21 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				continue
 			}
 			s.sawGeneration = true
-		}
 
-		// 客户端动作帧：上游要求我们执行一次内置工具。
-		if action := proto.FirstBytes(top, fieldClientAction); action != nil {
-			if call := parseNativeToolCall(action); call != nil {
-				s.sawGeneration = true
+			// 内置工具调用：参数完整的「调用完成」帧
+			if call := parseNativeToolCall(smFields); call != nil && !s.emitted[call.ID] {
+				if s.emitted == nil {
+					s.emitted = map[string]bool{}
+				}
+				s.emitted[call.ID] = true
 				s.sawToolCall = true
 				send(StreamEvent{Kind: EventToolCall, Tool: call})
+				continue
 			}
+		}
+
+		// 客户端动作帧只是同一次调用的摘要通知，参数不全，忽略即可。
+		if _, ok := top[fieldClientAction]; ok {
 			continue
 		}
 

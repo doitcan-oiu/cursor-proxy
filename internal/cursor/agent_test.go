@@ -49,6 +49,131 @@ func conversationFrame(index int) []byte {
 	return frame(0x00, top.Finish())
 }
 
+// toolCallFrame 复刻上游的「工具调用完成」帧：
+// top{1: sm{2{1: 调用id, 2{<工具字段>{1{<参数>}}}}}}
+func toolCallFrame(id string, toolField int, args *proto.Writer) []byte {
+	inner := proto.NewWriter()
+	inner.Bytes(1, args.Finish())
+
+	wrapper := proto.NewWriter()
+	wrapper.Bytes(toolField, inner.Finish())
+
+	done := proto.NewWriter()
+	done.Str(1, id)
+	done.Bytes(2, wrapper.Finish())
+
+	sm := proto.NewWriter()
+	sm.Bytes(smToolCallDone, done.Finish())
+
+	top := proto.NewWriter()
+	top.Bytes(fieldStreamMessage, sm.Finish())
+	return frame(0x00, top.Finish())
+}
+
+func collectTools(t *testing.T, data []byte) []NativeToolCall {
+	t.Helper()
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events)
+
+	var out []NativeToolCall
+	for ev := range events {
+		if ev.Kind == EventToolCall && ev.Tool != nil {
+			out = append(out, *ev.Tool)
+		}
+	}
+	return out
+}
+
+// 写文件的参数（路径 + 内容）只出现在「调用完成」帧里；
+// 顶层的客户端动作帧只带路径，据此还原会得到错误的调用。
+func TestParseNativeWriteFile(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "/tmp/cube.py")
+	args.Str(6, "print(1)\n")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_w1", toolWriteFile, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 {
+		t.Fatalf("应解析出 1 个调用，得到 %d", len(calls))
+	}
+	c := calls[0]
+	if c.Kind != ToolWriteFile || c.Path != "/tmp/cube.py" || c.Content != "print(1)\n" {
+		t.Fatalf("写文件解析错误: %+v", c)
+	}
+	if c.ID != "toolu_w1" {
+		t.Fatalf("调用 id = %q", c.ID)
+	}
+}
+
+func TestParseNativeReadFile(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "/etc/hostname")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_r1", toolReadFile, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 || calls[0].Kind != ToolReadFile || calls[0].Path != "/etc/hostname" {
+		t.Fatalf("读文件解析错误: %+v", calls)
+	}
+}
+
+func TestParseNativeRunTerminal(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "ls -la")
+	args.Str(15, "List files")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_t1", toolRunTerminal, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 {
+		t.Fatalf("应解析出 1 个调用，得到 %+v", calls)
+	}
+	if calls[0].Kind != ToolRunTerminal || calls[0].Command != "ls -la" || calls[0].Description != "List files" {
+		t.Fatalf("终端命令解析错误: %+v", calls[0])
+	}
+}
+
+func TestParseNativeSearchFiles(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "foobar")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_s1", toolSearchFiles, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 || calls[0].Kind != ToolSearchFiles || calls[0].Pattern != "foobar" {
+		t.Fatalf("搜索解析错误: %+v", calls)
+	}
+}
+
+// 同一次调用会先后出现多个帧，必须按调用 id 去重，否则客户端会重复执行。
+func TestNativeToolCallDeduplicatedByID(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "/tmp/a.txt")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_dup", toolReadFile, args)...)
+	data = append(data, toolCallFrame("toolu_dup", toolReadFile, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	if calls := collectTools(t, data); len(calls) != 1 {
+		t.Fatalf("同一调用 id 应只产出一次，得到 %d", len(calls))
+	}
+}
+
 // heldOpenBody 先吐出预置数据，然后一直阻塞不返回 EOF，
 // 模拟上游发完 end-of-stream 帧后仍不关闭连接的真实行为。
 type heldOpenBody struct {

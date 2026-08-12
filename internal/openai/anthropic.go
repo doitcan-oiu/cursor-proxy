@@ -27,6 +27,7 @@ type anthropicBlock struct {
 	// tool_result
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"`
+	IsError   bool            `json:"is_error"`
 }
 
 type anthropicMessage struct {
@@ -119,7 +120,13 @@ func blocksToText(raw json.RawMessage) string {
 			if sb.Len() > 0 {
 				sb.WriteString("\n")
 			}
-			sb.WriteString(fmt.Sprintf("[tool result %s] %s", b.ToolUseID, blocksToText(b.Content)))
+			// 结果用显式标签包起来，模型更容易把它和自己的调用对应上；
+			// 失败结果单独标注，避免模型看不出「上一次已经失败了」而原样重试。
+			status := "tool_result"
+			if b.IsError {
+				status = "tool_error"
+			}
+			sb.WriteString(fmt.Sprintf("<%s id=%q>\n%s\n</%s>", status, b.ToolUseID, blocksToText(b.Content), status))
 		default:
 			sb.WriteString(b.Text)
 		}

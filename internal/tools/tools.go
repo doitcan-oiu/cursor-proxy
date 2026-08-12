@@ -76,6 +76,12 @@ func BuildSystemPrompt(defs []Definition, choice Choice) string {
 	b.WriteString("  the SAME reply MUST contain the corresponding " + OpenTag + " block.\n")
 	b.WriteString("- If a task needs several steps, call the first tool now; you will be invoked again\n")
 	b.WriteString("  with the result and can continue from there.\n")
+	// 上游的系统提示要求「编辑前必须先读文件」。创建新文件时这条规则会让模型
+	// 反复去读一个不存在的文件，陷入死循环——必须显式豁免。
+	b.WriteString("- If a read fails because the file does not exist, do NOT read it again.\n")
+	b.WriteString("  The file simply needs to be created: call the write/create tool directly.\n")
+	b.WriteString("- Never repeat a tool call that already failed with the same arguments.\n")
+	b.WriteString("  Change your approach instead.\n")
 
 	switch choice.Mode {
 	case "required":
