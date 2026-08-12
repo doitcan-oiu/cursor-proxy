@@ -318,6 +318,7 @@ const (
 	toolSearchFiles = 5  // { 1: 查询串, 4: 输出模式 }
 	toolReadFile    = 8  // { 1: 路径 }
 	toolWriteFile   = 12 // { 1: 路径, 6: 内容 }
+	toolTask        = 19 // { 1: 任务描述, 2: 任务提示词, 4: 模型 }
 )
 
 // parseNativeToolCall 从「工具调用完成」帧里解出内置工具调用。
@@ -374,6 +375,14 @@ func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
 	if a := args(toolSearchFiles); a != nil {
 		if q := proto.FirstString(a, 1); q != "" {
 			return &NativeToolCall{Kind: ToolSearchFiles, ID: id, Pattern: q}
+		}
+	}
+	if a := args(toolTask); a != nil {
+		if prompt := proto.FirstString(a, 2); prompt != "" {
+			return &NativeToolCall{
+				Kind: ToolTask, ID: id,
+				Description: proto.FirstString(a, 1), Prompt: prompt,
+			}
 		}
 	}
 	return nil

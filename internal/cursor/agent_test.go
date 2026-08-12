@@ -159,6 +159,33 @@ func TestParseNativeSearchFiles(t *testing.T) {
 	}
 }
 
+// 「分析整个项目」这类任务上游会派发子 agent，漏掉它同样会让对话只回一句就断。
+func TestParseNativeTask(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "Analyze project structure")
+	args.Str(2, "Analyze the structure of the current project")
+	args.Str(4, "claude-4.6-opus-max")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_task1", toolTask, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 {
+		t.Fatalf("应解析出 1 个调用，得到 %+v", calls)
+	}
+	c := calls[0]
+	if c.Kind != ToolTask {
+		t.Fatalf("类型 = %v，期望 %v", c.Kind, ToolTask)
+	}
+	if c.Description != "Analyze project structure" {
+		t.Fatalf("任务描述 = %q", c.Description)
+	}
+	if c.Prompt != "Analyze the structure of the current project" {
+		t.Fatalf("任务提示词 = %q", c.Prompt)
+	}
+}
+
 // 同一次调用会先后出现多个帧，必须按调用 id 去重，否则客户端会重复执行。
 func TestNativeToolCallDeduplicatedByID(t *testing.T) {
 	args := proto.NewWriter()

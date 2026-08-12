@@ -89,6 +89,33 @@ func TestMapNativeAlternativeNames(t *testing.T) {
 	}
 }
 
+func TestMapNativeTask(t *testing.T) {
+	defs := []Definition{{
+		Name: "task",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"description":{"type":"string"},` +
+			`"prompt":{"type":"string"},"subagent_type":{"type":"string"}},` +
+			`"required":["description","prompt","subagent_type"]}`),
+	}}
+	got, ok := MapNative(Native{
+		ID: "toolu_t", Kind: KindTask,
+		Description: "Analyze project", Prompt: "Analyze the structure",
+	}, defs)
+	if !ok || got.Name != "task" {
+		t.Fatalf("应映射到 task，得到 %+v ok=%v", got, ok)
+	}
+	var args map[string]any
+	_ = json.Unmarshal([]byte(got.Arguments), &args)
+	if args["prompt"] != "Analyze the structure" {
+		t.Fatalf("prompt 未填入: %v", args)
+	}
+	if args["description"] != "Analyze project" {
+		t.Fatalf("必填的 description 未补全: %v", args)
+	}
+	if args["subagent_type"] == nil {
+		t.Fatalf("必填的 subagent_type 未补全: %v", args)
+	}
+}
+
 func TestMapNativeNoMatchingTool(t *testing.T) {
 	defs := []Definition{{Name: "get_weather", Parameters: json.RawMessage(`{"type":"object"}`)}}
 	if _, ok := MapNative(Native{Kind: KindRunTerminal, Command: "ls"}, defs); ok {

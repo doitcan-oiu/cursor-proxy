@@ -26,6 +26,8 @@ const (
 	KindSearchFiles NativeKind = "search_files"
 	// KindWriteFile 写入文件。
 	KindWriteFile NativeKind = "write_file"
+	// KindTask 派发子 agent。
+	KindTask NativeKind = "task"
 )
 
 // Native 是归一化后的上游内置工具调用。
@@ -36,6 +38,7 @@ type Native struct {
 	Command     string
 	Pattern     string
 	Content     string
+	Prompt      string
 	Description string
 }
 
@@ -56,6 +59,9 @@ var candidateNames = map[NativeKind][]string{
 	KindWriteFile: {
 		"write", "write_file", "create_file", "edit", "str_replace_editor", "apply_patch",
 	},
+	KindTask: {
+		"task", "agent", "subagent", "dispatch_agent", "delegate",
+	},
 }
 
 // 参数名候选：把上游的值填进客户端 schema 里对应的属性。
@@ -64,6 +70,7 @@ var candidateParams = map[NativeKind][]string{
 	KindRunTerminal: {"command", "cmd", "script", "shell_command"},
 	KindSearchFiles: {"pattern", "glob", "query", "globPattern", "path"},
 	KindWriteFile:   {"filePath", "file_path", "path", "target_file", "filename", "file"},
+	KindTask:        {"prompt", "task", "instructions", "input", "message"},
 }
 
 // MapNative 把一次上游内置调用映射成客户端声明的工具调用。
@@ -80,6 +87,8 @@ func MapNative(n Native, defs []Definition) (Call, bool) {
 		value = n.Command
 	case KindSearchFiles:
 		value = n.Pattern
+	case KindTask:
+		value = n.Prompt
 	default:
 		value = n.Path
 	}
@@ -99,13 +108,19 @@ func MapNative(n Native, defs []Definition) (Call, bool) {
 			args["content"] = n.Content
 		}
 	}
-	// 部分客户端（如 OpenCode 的 bash）要求必填 description
-	if n.Kind == KindRunTerminal && schemaRequires(def, "description") {
+	// 部分客户端（如 OpenCode 的 bash / task）要求必填 description
+	if schemaRequires(def, "description") {
 		desc := n.Description
 		if desc == "" {
-			desc = "Run command"
+			desc = defaultDescription(n.Kind)
 		}
 		args["description"] = desc
+	}
+	// task 工具通常还要指定子 agent 类型
+	if n.Kind == KindTask {
+		if key, ok := matchNamedParam(def, "subagent_type", "subagentType", "agent", "agent_type"); ok {
+			args[key] = "general"
+		}
 	}
 
 	raw, err := json.Marshal(args)
@@ -142,6 +157,29 @@ func matchTool(kind NativeKind, defs []Definition) (Definition, bool) {
 func matchParam(kind NativeKind, def Definition) (string, bool) {
 	props := schemaProperties(def)
 	for _, want := range candidateParams[kind] {
+		for name := range props {
+			if strings.EqualFold(name, want) {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+func defaultDescription(kind NativeKind) string {
+	switch kind {
+	case KindRunTerminal:
+		return "Run command"
+	case KindTask:
+		return "Subtask"
+	}
+	return "Tool call"
+}
+
+// matchNamedParam 在 schema 里找出候选名之一对应的属性。
+func matchNamedParam(def Definition, wants ...string) (string, bool) {
+	props := schemaProperties(def)
+	for _, want := range wants {
 		for name := range props {
 			if strings.EqualFold(name, want) {
 				return name, true
@@ -218,6 +256,8 @@ func DescribeNative(n Native) string {
 		return "（上游请求搜索文件：" + n.Pattern + "）"
 	case KindWriteFile:
 		return "（上游请求写入文件：" + n.Path + "）"
+	case KindTask:
+		return "（上游请求派发子任务：" + n.Description + "）"
 	}
 	return ""
 }

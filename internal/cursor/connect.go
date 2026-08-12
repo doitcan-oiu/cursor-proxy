@@ -37,6 +37,8 @@ const (
 	ToolSearchFiles NativeToolKind = "search_files"
 	// ToolWriteFile 写入文件。
 	ToolWriteFile NativeToolKind = "write_file"
+	// ToolTask 派发一个子 agent 去完成子任务。
+	ToolTask NativeToolKind = "task"
 )
 
 // NativeToolCall 是上游发来的一次内置工具调用请求。
@@ -50,6 +52,7 @@ type NativeToolCall struct {
 	Command     string // ToolRunTerminal
 	Pattern     string // ToolSearchFiles
 	Content     string // ToolWriteFile
+	Prompt      string // ToolTask
 	Description string
 }
 
