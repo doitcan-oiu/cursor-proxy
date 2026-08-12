@@ -8,51 +8,52 @@ import (
 	"cursor-proxy/internal/types"
 )
 
-// EncodeAgentRequest 构造 agentn.api5 的 AgentClientMessage/AgentRunRequest（未加 Connect 信封）。
-// 取最后一条 user 消息作为本轮输入，其余（含 system）作为上下文文件塞进 ExplicitContext。
-func EncodeAgentRequest(messages []types.Message, modelID string) []byte {
-	var lastUserIdx = -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			lastUserIdx = i
-			break
-		}
+// BuildPrompt 把整轮对话拍平成一段提示词。
+//
+// 这里刻意不使用 ExplicitContext 的「文件上下文」：早期实现把历史塞进一个假的
+// /context.txt，结果 Cursor 的 agent 会认为自己身处代码工作区，先回一句
+// 「先读取工作区规则…」然后发起工具调用就结束本轮——对纯对话代理来说这等于
+// 每次都被截断。把对话直接写进消息正文后，模型会直接作答。
+func BuildPrompt(messages []types.Message) string {
+	// 单条 user 消息原样送出，不加任何包装
+	if len(messages) == 1 && messages[0].Role == "user" {
+		return types.ContentToText(messages[0].Content)
 	}
 
-	var text string
-	if lastUserIdx >= 0 {
-		text = types.ContentToText(messages[lastUserIdx].Content)
-	} else if len(messages) > 0 {
-		text = types.ContentToText(messages[len(messages)-1].Content)
-	}
-
-	var historyParts []string
-	for i, m := range messages {
-		if i == lastUserIdx {
+	var b strings.Builder
+	for _, m := range messages {
+		content := strings.TrimSpace(types.ContentToText(m.Content))
+		if content == "" {
 			continue
 		}
-		historyParts = append(historyParts, m.Role+": "+types.ContentToText(m.Content))
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		switch m.Role {
+		case "system", "developer":
+			// 系统提示直接作为正文开头，不加角色前缀
+			b.WriteString(content)
+		default:
+			b.WriteString(m.Role)
+			b.WriteString(": ")
+			b.WriteString(content)
+		}
 	}
-	history := strings.Join(historyParts, "\n")
-	if history == "" {
-		history = "chat"
-	}
+	return b.String()
+}
 
+// EncodeAgentRequest 构造 agentn.api5 的 AgentClientMessage/AgentRunRequest（未加 Connect 信封）。
+func EncodeAgentRequest(messages []types.Message, modelID string) []byte {
 	userMsg := NewWriter()
-	userMsg.Str(1, text)
+	userMsg.Str(1, BuildPrompt(messages))
 	userMsg.Str(2, uuid.NewString())
 	userMsg.Str(3, "")
 
-	fileCtx := NewWriter()
-	fileCtx.Str(1, "/context.txt")
-	fileCtx.Str(2, history)
-
-	explicitCtx := NewWriter()
-	explicitCtx.Bytes(2, fileCtx.Finish())
-
+	// ExplicitContext 是必填的：完全省略这个字段时上游会接受请求但一个字都不生成。
+	// 这里给一个空上下文，避免伪造文件让 agent 以为身处代码工作区。
 	userMsgAction := NewWriter()
 	userMsgAction.Bytes(1, userMsg.Finish())
-	userMsgAction.Bytes(2, explicitCtx.Finish())
+	userMsgAction.Bytes(2, []byte{})
 
 	convAction := NewWriter()
 	convAction.Bytes(1, userMsgAction.Finish())
