@@ -284,22 +284,39 @@ func TestChatStream(model, prompt, accountID string, onDelta func(TestDelta)) bo
 	defer stream.Close()
 
 	gotText := false
+	emit := func(s string) {
+		if s == "" {
+			return
+		}
+		gotText = true
+		onDelta(TestDelta{Content: s})
+	}
+	// 调试台永远是纯对话，写文件的内容直接当正文流式吐出
+	live := tools.NewLiveWriter(true)
+
 	for ev := range stream.Events {
 		switch ev.Kind {
 		case cursor.EventDelta:
 			if ev.Text != "" {
 				gotText = true
+				emit(live.Interrupt())
 			}
 			onDelta(TestDelta{Content: ev.Text, Reasoning: ev.Thinking})
+		case cursor.EventToolInputDelta:
+			n := nativeOf(ev.Tool)
+			emit(live.Push(&n, ev.Text))
 		case cursor.EventToolCall:
-			if s := toolText(ev.Tool); s != "" {
-				gotText = true
-				onDelta(TestDelta{Content: s})
+			n2 := nativeOf(ev.Tool)
+			if s, handled := live.Finish(&n2); handled {
+				emit(s)
+				continue
 			}
+			emit(toolText(ev.Tool))
 		case cursor.EventError:
 			onDelta(TestDelta{Error: ev.Message})
 		}
 	}
+	emit(live.Interrupt())
 	return gotText
 }
 
@@ -307,6 +324,14 @@ func TestChatStream(model, prompt, accountID string, onDelta func(TestDelta)) bo
 func toolText(c *cursor.NativeToolCall) string {
 	if c == nil {
 		return ""
+	}
+	return tools.NativeToText(nativeOf(c))
+}
+
+// nativeOf 把 cursor 层的内置调用转成 tools 层的形态。
+func nativeOf(c *cursor.NativeToolCall) tools.Native {
+	if c == nil {
+		return tools.Native{}
 	}
 	kind := tools.KindUnknown
 	switch c.Kind {
@@ -329,11 +354,11 @@ func toolText(c *cursor.NativeToolCall) string {
 	case cursor.ToolTodoWrite:
 		kind = tools.KindTodoWrite
 	}
-	return tools.NativeToText(tools.Native{
-		Kind: kind, Path: c.Path, Command: c.Command, Pattern: c.Pattern,
+	return tools.Native{
+		ID: c.ID, Kind: kind, Path: c.Path, Command: c.Command, Pattern: c.Pattern,
 		Content: c.Content, Prompt: c.Prompt, URL: c.URL,
 		Description: c.Description, Field: c.Field,
-	})
+	}
 }
 
 // AccountsHealth 返回账号健康快照。

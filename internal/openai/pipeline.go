@@ -85,8 +85,11 @@ func OpenWithFailover(messages []types.Message, model string) (*OpenedStream, *c
 			buffered = append(buffered, ev)
 			// 正文或工具调用都算「这一轮成功了」。工具调用轮次经常没有正文，
 			// 漏掉它会被误判成空响应而重试，白白丢掉调用。
+			// 工具参数片段同样算数：上游写长文件时会先发几十个片段、最后才发完整调用，
+			// 漏掉它会把这些片段全压在缓冲里，等到调用结束才一次性放行，流式就没了。
 			// 思考内容不算——上游存在「只吐思考、不给正文」的空转轮次。
 			if ev.Kind == cursor.EventToolCall ||
+				(ev.Kind == cursor.EventToolInputDelta && ev.Text != "") ||
 				(ev.Kind == cursor.EventDelta && ev.Text != "") {
 				committed = true
 				break

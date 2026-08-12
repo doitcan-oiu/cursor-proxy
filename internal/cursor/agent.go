@@ -311,8 +311,59 @@ const (
 
 // StreamMessage 里与工具调用相关的字段。
 const (
-	smToolCallDone = 2 // 调用完成：{ 1: 调用 id, 2: 参数容器, 3: 消息 id }
+	smToolCallDone     = 2  // 调用完成：{ 1: 调用 id, 2: 参数容器, 3: 消息 id }
+	smToolCallProgress = 7  // 调用进行中：结构同上，参数尚不完整
+	smToolInputDelta   = 15 // 参数流式片段：{ 1: 调用 id, 2{3{1: 文本片段}} }
 )
+
+// parseToolProgress 从「进行中」帧里取出调用 id、工具类型与已知路径。
+// 参数还没发完，但类型和路径先到，足以判断后续片段要不要流式输出。
+func parseToolProgress(sm map[int][]proto.Field) (id string, kind NativeToolKind, path string, ok bool) {
+	body := proto.FirstBytes(sm, smToolCallProgress)
+	if body == nil {
+		return "", "", "", false
+	}
+	f := proto.Decode(body)
+	id = proto.FirstString(f, 1)
+	wrapper := proto.FirstBytes(f, 2)
+	if id == "" || wrapper == nil {
+		return "", "", "", false
+	}
+	w := proto.Decode(wrapper)
+	for field, kindOf := range map[int]NativeToolKind{
+		toolWriteFile: ToolWriteFile, toolReadFile: ToolReadFile,
+		toolRunTerminal: ToolRunTerminal, toolSearchFiles: ToolSearchFiles,
+		toolListFiles: ToolListFiles, toolDeleteFile: ToolDeleteFile,
+		toolFetchURL: ToolFetchURL, toolTask: ToolTask, toolTodoWrite: ToolTodoWrite,
+	} {
+		if body := proto.FirstBytes(w, field); body != nil {
+			if inner := proto.FirstBytes(proto.Decode(body), 1); inner != nil {
+				path = proto.FirstString(proto.Decode(inner), 1)
+			}
+			return id, kindOf, path, true
+		}
+	}
+	return id, "", "", true
+}
+
+// parseToolInputDelta 取出参数的流式文本片段。
+func parseToolInputDelta(sm map[int][]proto.Field) (id, text string, ok bool) {
+	body := proto.FirstBytes(sm, smToolInputDelta)
+	if body == nil {
+		return "", "", false
+	}
+	f := proto.Decode(body)
+	id = proto.FirstString(f, 1)
+	wrapper := proto.FirstBytes(f, 2)
+	if id == "" || wrapper == nil {
+		return "", "", false
+	}
+	chunk := proto.FirstBytes(proto.Decode(wrapper), 3)
+	if chunk == nil {
+		return "", "", false
+	}
+	return id, proto.FirstString(proto.Decode(chunk), 1), true
+}
 
 // 参数容器内按「哪个字段被设置」区分工具类型，其值再套一层字段 1 才是真正的参数。
 // 例：2{12{1{1:"/a.py" 6:"内容"}}} 表示写文件。
@@ -495,6 +546,10 @@ type agentStreamState struct {
 	emitted map[string]bool
 	// model 仅用于给未识别工具的记录标注来源模型。
 	model string
+	// toolKind / toolPath 记录每次调用的工具类型与路径。
+	// 「进行中」帧先于参数片段到达，据此判断片段要不要转发。
+	toolKind map[string]NativeToolKind
+	toolPath map[string]string
 }
 
 // process 消费缓冲里完整的帧，返回是否遇到协议级结束帧。
@@ -546,6 +601,34 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				continue
 			}
 			s.sawGeneration = true
+
+			// 「进行中」帧先到：记下这次调用的工具类型与路径，
+			// 后续的参数片段才知道该不该转发。
+			if id, kind, path, ok := parseToolProgress(smFields); ok {
+				if s.toolKind == nil {
+					s.toolKind = map[string]NativeToolKind{}
+					s.toolPath = map[string]string{}
+				}
+				if kind != "" {
+					s.toolKind[id] = kind
+				}
+				if path != "" {
+					s.toolPath[id] = path
+				}
+				continue
+			}
+
+			// 参数流式片段
+			if id, text, ok := parseToolInputDelta(smFields); ok {
+				if text != "" {
+					send(StreamEvent{
+						Kind: EventToolInputDelta,
+						Text: text,
+						Tool: &NativeToolCall{ID: id, Kind: s.toolKind[id], Path: s.toolPath[id]},
+					})
+				}
+				continue
+			}
 
 			// 内置工具调用：参数完整的「调用完成」帧
 			if call := parseNativeToolCall(smFields); call != nil && !s.emitted[call.ID] {

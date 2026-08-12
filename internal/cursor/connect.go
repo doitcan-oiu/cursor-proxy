@@ -23,6 +23,9 @@ const (
 	EventEnd
 	// EventToolCall 上游要求客户端执行一次工具。
 	EventToolCall
+	// EventToolInputDelta 工具参数的流式片段。
+	// 上游把「写文件」这类调用的内容逐段发来，纯对话场景下可据此实现真正的流式输出。
+	EventToolInputDelta
 )
 
 // NativeToolKind 是上游内置工具的类型。

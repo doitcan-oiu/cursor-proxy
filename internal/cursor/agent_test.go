@@ -526,3 +526,87 @@ func (r *sliceReader) Read(p []byte) (int, error) {
 	r.pos += n
 	return n, nil
 }
+
+// progressFrame 复刻「调用进行中」帧：工具类型与路径先到，参数还没发完。
+func progressFrame(id string, toolField int, path string) []byte {
+	args := proto.NewWriter()
+	args.Str(1, path)
+	inner := proto.NewWriter()
+	inner.Bytes(1, args.Finish())
+	wrapper := proto.NewWriter()
+	wrapper.Bytes(toolField, inner.Finish())
+
+	body := proto.NewWriter()
+	body.Str(1, id)
+	body.Bytes(2, wrapper.Finish())
+
+	sm := proto.NewWriter()
+	sm.Bytes(smToolCallProgress, body.Finish())
+	top := proto.NewWriter()
+	top.Bytes(fieldStreamMessage, sm.Finish())
+	return frame(0x00, top.Finish())
+}
+
+// inputDeltaFrame 复刻参数的流式片段帧：sm{15{1: 调用id, 2{3{1: 文本}}}}。
+func inputDeltaFrame(id, text string) []byte {
+	chunk := proto.NewWriter()
+	chunk.Str(1, text)
+	holder := proto.NewWriter()
+	holder.Bytes(3, chunk.Finish())
+
+	body := proto.NewWriter()
+	body.Str(1, id)
+	body.Bytes(2, holder.Finish())
+
+	sm := proto.NewWriter()
+	sm.Bytes(smToolInputDelta, body.Finish())
+	top := proto.NewWriter()
+	top.Bytes(fieldStreamMessage, sm.Finish())
+	return frame(0x00, top.Finish())
+}
+
+// 上游是分片下发写文件内容的：先 sm.7 告知工具与路径，再若干 sm.15 片段。
+// 解析对了纯对话才能边收边吐，而不是等整段发完静默几十秒。
+func TestToolInputDeltasAreStreamed(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "/tmp/hello.py")
+	args.Str(6, "print(\"hi\")\n")
+
+	var data []byte
+	data = append(data, progressFrame("call-1", toolWriteFile, "/tmp/hello.py")...)
+	data = append(data, inputDeltaFrame("call-1", "print(")...)
+	data = append(data, inputDeltaFrame("call-1", "\"hi\")\n")...)
+	data = append(data, toolCallFrame("call-1", toolWriteFile, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var streamed string
+	var done int
+	for ev := range events {
+		switch ev.Kind {
+		case EventToolInputDelta:
+			if ev.Tool == nil || ev.Tool.ID != "call-1" {
+				t.Fatalf("片段应带上调用标识，得到 %+v", ev.Tool)
+			}
+			if ev.Tool.Kind != ToolWriteFile || ev.Tool.Path != "/tmp/hello.py" {
+				t.Fatalf("片段应继承进行中帧的工具类型与路径，得到 %+v", ev.Tool)
+			}
+			streamed += ev.Text
+		case EventToolCall:
+			done++
+		}
+	}
+
+	if streamed != "print(\"hi\")\n" {
+		t.Fatalf("片段应按序拼回完整内容，得到 %q", streamed)
+	}
+	if done != 1 {
+		t.Fatalf("完成帧仍应下发一次，得到 %d", done)
+	}
+}

@@ -253,6 +253,10 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var nativeCalls []tools.Call
+		// 纯对话（客户端没声明工具）时，把写文件调用的内容边收边吐，
+		// 否则长内容要等整个调用发完才一次性出现。
+		live := tools.NewLiveWriter(len(toolDefs) == 0)
+
 		for ev := range events {
 			switch ev.Kind {
 			case cursor.EventDelta:
@@ -261,13 +265,20 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					writeSSE(sseChunk(id, body.Model, map[string]any{"reasoning_content": ev.Thinking}, nil))
 				}
 				if ev.Text != "" {
+					emitText(live.Interrupt())
 					if scanner != nil {
 						emitText(scanner.Push(ev.Text))
 					} else {
 						emitText(ev.Text)
 					}
 				}
+			case cursor.EventToolInputDelta:
+				emitText(live.Push(toNativePtr(ev.Tool), ev.Text))
 			case cursor.EventToolCall:
+				if s, handled := live.Finish(toNativePtr(ev.Tool)); handled {
+					emitText(s)
+					continue
+				}
 				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
 					nativeCalls = append(nativeCalls, c)
 				} else {
@@ -280,6 +291,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeSSE("data: " + string(b) + "\n\n")
 			}
 		}
+
+		emitText(live.Interrupt())
 
 		finish := "stop"
 		calls := nativeCalls
@@ -395,6 +408,15 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": finishReason}},
 		"usage":   usagePayload(promptTokens, completionTokens),
 	})
+}
+
+// toNativePtr 与 toNative 相同，但保留 nil 语义，供流式写出器判断。
+func toNativePtr(c *cursor.NativeToolCall) *tools.Native {
+	if c == nil {
+		return nil
+	}
+	n := toNative(c)
+	return &n
 }
 
 // toNative 把 cursor 层的内置调用转成 tools 层的形态（两层不互相依赖）。

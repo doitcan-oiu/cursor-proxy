@@ -83,5 +83,5 @@ func truncStr(s string, n int) string {
 
 func debugFrame(flag byte, length uint32, payload []byte) {
 	log.Printf("[frame %6.3fs] flag=%#02x len=%-5d %s",
-		time.Since(debugStart).Seconds(), flag, length, describeDeep(payload, 3))
+		time.Since(debugStart).Seconds(), flag, length, describeDeep(payload, 6))
 }

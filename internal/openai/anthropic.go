@@ -241,17 +241,27 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var calls []tools.Call
+		// 纯对话时把写文件的内容边收边吐，避免长内容静默几十秒再整段出现
+		live := tools.NewLiveWriter(len(toolDefs) == 0)
+
 		for ev := range events {
 			switch ev.Kind {
 			case cursor.EventDelta:
 				if ev.Text != "" {
+					emitText(live.Interrupt())
 					if scanner != nil {
 						emitText(scanner.Push(ev.Text))
 					} else {
 						emitText(ev.Text)
 					}
 				}
+			case cursor.EventToolInputDelta:
+				emitText(live.Push(toNativePtr(ev.Tool), ev.Text))
 			case cursor.EventToolCall:
+				if s, handled := live.Finish(toNativePtr(ev.Tool)); handled {
+					emitText(s)
+					continue
+				}
 				// 上游内置工具调用：翻译成客户端声明的工具
 				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
 					calls = append(calls, c)
@@ -263,6 +273,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				errMsg = ev.Message
 			}
 		}
+		emitText(live.Interrupt())
 
 		stopReason := "end_turn"
 		if scanner != nil {
