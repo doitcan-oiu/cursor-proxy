@@ -42,6 +42,9 @@ type Config struct {
 	// AgentFinishIdleMs 是上游回写会话记录（本轮生成结束）之后的收尾等待。
 	// 上游永不关闭连接、只每 10s 发心跳，靠这个短窗口收残余帧后立刻结束。
 	AgentFinishIdleMs int
+	// AgentHardCapMs 是单轮对话的时长兜底，防的是「一直吐、永远不停」的失控流。
+	// 卡住的流由 AgentIdleMs 负责，所以这里给得很宽：早期默认 180s，
+	// 结果长文写到一半（约 1.5 万字）就被静默掐断，还报成正常结束。
 	AgentHardCapMs    int
 	AgentFirstTokenMs int
 
@@ -119,7 +122,7 @@ func Get() *Config {
 			AgentClientVersion:  envStr("CURSOR_AGENT_CLIENT_VERSION", "cli-2026.01.28-fd13201"),
 			AgentIdleMs:         envInt("AGENT_IDLE_MS", 6000),
 			AgentFinishIdleMs:   envInt("AGENT_FINISH_IDLE_MS", 400),
-			AgentHardCapMs:      envInt("AGENT_HARD_CAP_MS", 180000),
+			AgentHardCapMs:      envInt("AGENT_HARD_CAP_MS", 1800000),
 			AgentFirstTokenMs:   envInt("AGENT_FIRST_TOKEN_MS", 60000),
 			LoginHeadless:       envStr("CURSOR_LOGIN_HEADLESS", "true") != "false",
 			LoginTimeoutMs:      envInt("ACCOUNT_LOGIN_TIMEOUT_MS", 180000),

@@ -292,6 +292,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var nativeCalls []tools.Call
+		truncated := false
 		// 纯对话（客户端没声明工具）时，把写文件调用的内容边收边吐，
 		// 否则长内容要等整个调用发完才一次性出现。
 		live := tools.NewLiveWriter(len(toolDefs) == 0)
@@ -323,6 +324,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				} else {
 					emitText(tools.NativeToText(toNative(ev.Tool)))
 				}
+			case cursor.EventEnd:
+				truncated = ev.Truncated
 			case cursor.EventError:
 				errored = true
 				errMsg = ev.Message
@@ -333,7 +336,11 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		emitText(live.Interrupt())
 
+		// 被时长上限掐断时报 length，别让半截回答看起来像正常收尾
 		finish := "stop"
+		if truncated {
+			finish = "length"
+		}
 		calls := nativeCalls
 		if scanner != nil {
 			emitText(scanner.Flush())
@@ -381,6 +388,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	content := ""
 	reasoning := ""
 	lastError := ""
+	truncated := false
 	var toolCalls []tools.Call
 	for ev := range events {
 		switch ev.Kind {
@@ -393,6 +401,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				content += tools.NativeToText(toNative(ev.Tool))
 			}
+		case cursor.EventEnd:
+			truncated = ev.Truncated
 		case cursor.EventError:
 			lastError = ev.Message
 		}
@@ -423,6 +433,9 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		message["reasoning_content"] = reasoning
 	}
 	finishReason := "stop"
+	if truncated {
+		finishReason = "length"
+	}
 	if len(toolCalls) > 0 {
 		list := make([]map[string]any, 0, len(toolCalls))
 		for _, c := range toolCalls {

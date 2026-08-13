@@ -266,6 +266,26 @@ agent.v1.UserMessage.4 = mode
 「I'm currently in Ask mode…」。试过用 `AgentRunRequest.8 = custom_system_prompt`
 压掉这句，上游返回 `invalid_argument`，这条路走不通。留了 `ASK_MODE=off` 作退路。
 
+### ~~P0：长回答写到一半被时长上限静默掐断~~（已在 Go 版修复）
+`AGENT_HARD_CAP_MS` 默认 180 秒，且是从建流那一刻算起的墙钟时间，不看流是否还在正常输出。
+长文写到 180 秒就被切断，而且切断时只发一个普通的 `EventEnd`，
+客户端收到 `finish_reason=stop`——**半截回答看起来像正常说完**，这是最难排查的一类失败。
+
+实测（`claude-4.6-opus-max`，一篇 1.5 万字技术长文）：
+
+```
+修复前：181.3s  finish_reason=stop  15744 字  结尾 "…典型配置 50ms × 3"   ← 断在词中间
+修复后：553.1s  finish_reason=stop  48623 字  结尾 "…而是贯穿整个协议栈的系统工程。"
+```
+
+被掐断时输出仍在稳定流动（每 20 秒约 1450 字），完全不是卡住——说明这个上限
+掐的是正常工作的流。卡住的流本来就由 `AGENT_IDLE_MS`（默认 6 秒）负责，
+时长上限只该防「一直吐、永远不停」的失控流，所以默认值放宽到 1800 秒。
+
+同时给 `EventEnd` 加了 `Truncated` 标记：真触发上限时报
+`finish_reason=length`（Anthropic 侧 `stop_reason=max_tokens`）并打一行日志，
+调试台会追加一句说明。截断可以接受，静默截断不行。
+
 ### P2：`checkAllAccounts` / 批量验号会打真实计费请求
 `get-current-period-usage` 和 `full_stripe_profile` 每次验号都会请求 Cursor 官方接口。账号多时
 一轮全量验号是几十上百个外部请求，且无缓存。建议对 plan/usage 结果做短 TTL 缓存（如 5 分钟），

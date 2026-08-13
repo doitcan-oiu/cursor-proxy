@@ -354,6 +354,10 @@ func TestChatStream(req TestChatRequest, onDelta func(TestDelta)) bool {
 				continue
 			}
 			emit(toolText(ev.Tool))
+		case cursor.EventEnd:
+			if ev.Truncated {
+				emit("\n\n（已达单轮时长上限，回答被截断。可调大 AGENT_HARD_CAP_MS）")
+			}
 		case cursor.EventError:
 			onDelta(TestDelta{Error: ev.Message})
 		}

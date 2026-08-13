@@ -152,6 +152,11 @@ func (s *AgentStream) Close() {
 	}
 }
 
+// hardCapFor 给出单轮对话的时长兜底，测试里会替换成很短的值来验证截断路径。
+var hardCapFor = func() time.Duration {
+	return time.Duration(config.Get().AgentHardCapMs) * time.Millisecond
+}
+
 // StreamAgent 向 agentn.api5 发起 Run 流式对话，返回事件流。
 // 初始请求失败返回 error；流内错误以 EventError 事件下发。
 //
@@ -195,7 +200,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 	cfg := config.Get()
 	idle := time.Duration(cfg.AgentIdleMs) * time.Millisecond
 	finishIdle := time.Duration(cfg.AgentFinishIdleMs) * time.Millisecond
-	hardCap := time.Duration(cfg.AgentHardCapMs) * time.Millisecond
+	hardCap := hardCapFor()
 	firstToken := time.Duration(cfg.AgentFirstTokenMs) * time.Millisecond
 	start := time.Now()
 
@@ -286,9 +291,14 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 				}
 				return
 			}
+			// 时长上限只是兜底，防的是「一直吐、永远不停」的失控流。
+			// 卡住的流由 idle 超时（默认 6s）负责，不归这里管——所以这个值可以给得很宽，
+			// 掐断正在正常输出的长回答比让它多跑几分钟糟糕得多。
 			if time.Since(start) > hardCap {
+				log.Printf("[agent] 达到 %s 时长上限，本轮被截断（已输出 %d 字节）",
+					hardCap, state.textBytes)
 				if !state.errored {
-					send(StreamEvent{Kind: EventEnd})
+					send(StreamEvent{Kind: EventEnd, Truncated: true})
 				}
 				return
 			}
@@ -535,7 +545,9 @@ func isPrintableText(s string) bool {
 // agentStreamState 跟踪一次流的解析状态。
 type agentStreamState struct {
 	gotContent bool // 是否已产出过正文
-	errored    bool // 是否已下发过错误
+	// textBytes 累计产出的正文字节数，仅用于截断时的日志。
+	textBytes int
+	errored   bool // 是否已下发过错误
 	// sawGeneration 表示生成阶段已开始。用于区分开头回写的会话上下文
 	// 与结尾回写的会话记录——两者都是 fieldConversation 帧。
 	sawGeneration bool
@@ -679,6 +691,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			s.turnComplete = false
 			if delta.Content != "" {
 				s.gotContent = true
+				s.textBytes += len(delta.Content)
 			}
 			send(StreamEvent{Kind: EventDelta, Text: delta.Content, Thinking: delta.Thinking})
 		}

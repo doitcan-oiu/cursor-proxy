@@ -610,3 +610,83 @@ func TestToolInputDeltasAreStreamed(t *testing.T) {
 		t.Fatalf("完成帧仍应下发一次，得到 %d", done)
 	}
 }
+
+// dripBody 每隔一小段时间吐一帧，模拟「一直在正常输出」的长回答。
+type dripBody struct {
+	frame    []byte
+	every    time.Duration
+	done     chan struct{}
+	closeOne sync.Once
+}
+
+func (b *dripBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.done:
+		return 0, io.EOF
+	case <-time.After(b.every):
+		return copy(p, b.frame), nil
+	}
+}
+
+func (b *dripBody) Close() error {
+	b.closeOne.Do(func() { close(b.done) })
+	return nil
+}
+
+// 时长上限触发时必须标记 Truncated：早期版本直接发一个普通 EventEnd，
+// 客户端收到 finish_reason=stop，半截回答看起来像正常说完，最难排查。
+func TestHardCapMarksTruncated(t *testing.T) {
+	restore := hardCapFor
+	hardCapFor = func() time.Duration { return 120 * time.Millisecond }
+	defer func() { hardCapFor = restore }()
+
+	body := &dripBody{frame: contentFrame("续写中…"), every: 20 * time.Millisecond, done: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var gotText, sawEnd, truncated bool
+	for ev := range events {
+		switch ev.Kind {
+		case EventDelta:
+			gotText = true
+		case EventEnd:
+			sawEnd = true
+			truncated = ev.Truncated
+		}
+	}
+
+	if !gotText {
+		t.Fatal("截断前应该已经产出过正文")
+	}
+	if !sawEnd {
+		t.Fatal("应该收到结束事件")
+	}
+	if !truncated {
+		t.Fatal("被时长上限掐断时必须标记 Truncated，否则客户端会以为是正常收尾")
+	}
+}
+
+// 正常收尾（上游回写会话记录）不能被误标成截断。
+func TestNormalEndIsNotTruncated(t *testing.T) {
+	var data []byte
+	data = append(data, contentFrame("好的")...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	for ev := range events {
+		if ev.Kind == EventEnd && ev.Truncated {
+			t.Fatal("正常收尾不应标记为截断")
+		}
+	}
+}

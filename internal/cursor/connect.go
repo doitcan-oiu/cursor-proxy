@@ -82,6 +82,10 @@ type StreamEvent struct {
 	Thinking string
 	Message  string
 	Tool     *NativeToolCall
+	// Truncated 只在 EventEnd 上有意义：本轮不是模型自己说完的，
+	// 而是被代理的时长上限掐断的。客户端据此把结束原因报成「长度不足」，
+	// 而不是让半截回答看起来像正常收尾。
+	Truncated bool
 }
 
 func gzipBytes(b []byte) []byte {

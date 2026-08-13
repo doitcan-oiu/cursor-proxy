@@ -295,6 +295,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var calls []tools.Call
+		truncated := false
 		// 纯对话时把写文件的内容边收边吐，避免长内容静默几十秒再整段出现
 		live := tools.NewLiveWriter(len(toolDefs) == 0)
 
@@ -322,6 +323,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				} else {
 					emitText(tools.NativeToText(toNative(ev.Tool)))
 				}
+			case cursor.EventEnd:
+				truncated = ev.Truncated
 			case cursor.EventError:
 				errored = true
 				errMsg = ev.Message
@@ -329,7 +332,11 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		}
 		emitText(live.Interrupt())
 
+		// 被时长上限掐断时报 max_tokens——Anthropic 侧最接近「没说完」的语义
 		stopReason := "end_turn"
+		if truncated {
+			stopReason = "max_tokens"
+		}
 		if scanner != nil {
 			emitText(scanner.Flush())
 			calls = append(calls, scanner.Calls()...)
@@ -374,6 +381,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 
 	content := ""
 	lastError := ""
+	truncated := false
 	var toolCalls []tools.Call
 	for ev := range events {
 		switch ev.Kind {
@@ -385,6 +393,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			} else {
 				content += tools.NativeToText(toNative(ev.Tool))
 			}
+		case cursor.EventEnd:
+			truncated = ev.Truncated
 		case cursor.EventError:
 			lastError = ev.Message
 		}
@@ -414,6 +424,9 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		blocks = append(blocks, map[string]any{"type": "text", "text": content})
 	}
 	stopReason := "end_turn"
+	if truncated {
+		stopReason = "max_tokens"
+	}
 	for _, c := range toolCalls {
 		var input any = map[string]any{}
 		if json.Unmarshal([]byte(c.Arguments), &input) != nil {
