@@ -36,6 +36,13 @@ type OpenedStream struct {
 	Account  cursor.AcquiredAccount
 	Buffered []cursor.StreamEvent
 	Stream   *cursor.AgentStream
+	// 下面三段耗时用于定位「慢在哪」，只在开了 PROXY_TIMING 时会被打印。
+	// AcquireMs 含刷新 token；ConnectMs 是发出请求到拿到响应头；
+	// ProbeMs 是拿到响应头到确认这一轮有产出（等于上游的思考时间）。
+	AcquireMs int64
+	ConnectMs int64
+	ProbeMs   int64
+	Attempts  int
 }
 
 func backoff(attempt int) {
@@ -65,12 +72,17 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 	upstreamModel := cursor.ResolveUpstreamModel(model)
 
 	for attempt := 0; attempt < ab.MaxAttempts; attempt++ {
+		t0 := time.Now()
 		account := cursor.AcquireAccount(exclude)
 		if account == nil {
 			break
 		}
+		acquireMs := time.Since(t0).Milliseconds()
 
+		t1 := time.Now()
 		stream, err := cursor.StreamAgent(messages, upstreamModel, account.Bearer, account.ProxyURL, mode)
+		connectMs := time.Since(t1).Milliseconds()
+		probeStart := time.Now()
 		if err != nil {
 			status := 0
 			if aerr, ok := err.(*cursor.AgentUpstreamError); ok {
@@ -152,7 +164,11 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 			return nil, lastErr
 		}
 
-		return &OpenedStream{Account: *account, Buffered: buffered, Stream: stream}, nil
+		return &OpenedStream{
+			Account: *account, Buffered: buffered, Stream: stream,
+			AcquireMs: acquireMs, ConnectMs: connectMs,
+			ProbeMs: time.Since(probeStart).Milliseconds(), Attempts: attempt + 1,
+		}, nil
 	}
 
 	if lastErr != nil {

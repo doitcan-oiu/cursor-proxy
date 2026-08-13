@@ -226,17 +226,23 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tl := newTimeline("chat " + body.Model)
+	tl.mark("读请求体")
+
 	messages := parseMessages(body.Messages)
 	// 声明了 tools 才注入工具提示词；普通对话完全不受影响。
 	toolDefs := body.toolDefs()
 	messages = injectToolPrompt(messages, toolDefs, body.toolChoice())
+	tl.mark("解析消息")
 
 	id := "chatcmpl-" + uuid.NewString()
 	startedAt := time.Now()
 	keyPrefix := keyPrefixFromAuth(r)
 	promptTokens := tokenize.CountMessages(body.Model, messages)
+	tl.mark("算 token")
 
 	opened, uerr := OpenWithFailover(messages, body.Model, ModeFor(len(toolDefs)))
+	tl.mark("取号+建流")
 	if uerr != nil {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Stream: body.Stream, KeyPrefix: keyPrefix,
 			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(),
@@ -296,6 +302,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		var nativeCalls []tools.Call
 		truncated := false
+		gotFirst := false
 		// 纯对话（客户端没声明工具）时，把写文件调用的内容边收边吐，
 		// 否则长内容要等整个调用发完才一次性出现。
 		live := tools.NewLiveWriter(len(toolDefs) == 0)
@@ -303,6 +310,10 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		for ev := range events {
 			switch ev.Kind {
 			case cursor.EventDelta:
+				if !gotFirst {
+					gotFirst = true
+					tl.mark("等首个增量")
+				}
 				if ev.Thinking != "" {
 					reasoning.WriteString(ev.Thinking)
 					writeSSE(sseChunk(id, body.Model, map[string]any{"reasoning_content": ev.Thinking}, nil))
@@ -338,6 +349,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		emitText(live.Interrupt())
+		tl.mark("流式输出")
 
 		// 被时长上限掐断时报 length，别让半截回答看起来像正常收尾
 		finish := "stop"
@@ -386,6 +398,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Chars: utf8.RuneCountInString(content.String()), Tokens: completionTokens,
 			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
 		writeSSE("data: [DONE]\n\n")
+		tl.done(fmt.Sprintf(" :: 提示 %d tok / 输出 %d tok / %d 字",
+			promptTokens, completionTokens, utf8.RuneCountInString(content.String())))
 		return
 	}
 

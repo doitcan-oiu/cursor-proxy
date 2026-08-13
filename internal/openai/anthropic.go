@@ -251,6 +251,9 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = "auto"
 	}
+	tl := newTimeline("messages " + model)
+	tl.mark("读请求体")
+
 	messages := anthropicToInternal(body)
 	hasNonSystem := false
 	for _, m := range messages {
@@ -270,9 +273,12 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	startedAt := time.Now()
 	keyPrefix := anthropicKeyPrefix(r)
+	tl.mark("解析消息")
 	inputTokens := tokenize.CountMessages(model, messages)
+	tl.mark("算 token")
 
 	opened, uerr := OpenWithFailover(messages, model, ModeFor(len(toolDefs)))
+	tl.markOpen(opened)
 	if uerr != nil {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, KeyPrefix: keyPrefix, Stream: body.Stream,
 			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(),
@@ -333,12 +339,17 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 
 		var calls []tools.Call
 		truncated := false
+		gotFirst := false
 		// 纯对话时把写文件的内容边收边吐，避免长内容静默几十秒再整段出现
 		live := tools.NewLiveWriter(len(toolDefs) == 0)
 
 		for ev := range events {
 			switch ev.Kind {
 			case cursor.EventDelta:
+				if !gotFirst {
+					gotFirst = true
+					tl.mark("等首个增量")
+				}
 				if ev.Text != "" {
 					emitText(live.Interrupt())
 					if scanner != nil {
@@ -404,6 +415,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
 		})
 		send("message_stop", map[string]any{"type": "message_stop"})
+		tl.done(fmt.Sprintf(" :: 输入 %d tok / 输出 %d tok / %d 字",
+			inputTokens, outputTokens, utf8.RuneCountInString(content.String())))
 
 		outcome := cursor.OutcomeSuccess
 		if errored {
