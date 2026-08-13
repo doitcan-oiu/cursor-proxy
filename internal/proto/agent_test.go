@@ -57,7 +57,7 @@ func TestBuildPromptSkipsEmptyContent(t *testing.T) {
 // 请求里必须带 ExplicitContext（哪怕是空的）：完全省略该字段时上游不生成任何内容。
 // 同时不能再伪造 /context.txt 文件上下文，否则 agent 会转去调用工具读工作区。
 func TestEncodeAgentRequestHasEmptyExplicitContext(t *testing.T) {
-	raw := EncodeAgentRequest([]types.Message{{Role: "user", Content: "hi"}}, "auto")
+	raw := EncodeAgentRequest([]types.Message{{Role: "user", Content: "hi"}}, "auto", ModeAgent)
 
 	if strings.Contains(string(raw), "/context.txt") {
 		t.Fatal("不应再伪造文件上下文 /context.txt")
@@ -93,7 +93,7 @@ func TestEncodeAgentRequestCarriesImages(t *testing.T) {
 		},
 	}}
 
-	top := Decode(EncodeAgentRequest(msgs, "auto"))
+	top := Decode(EncodeAgentRequest(msgs, "auto", ModeAgent))
 	runReq := Decode(FirstBytes(top, 1))
 	action := Decode(FirstBytes(runReq, 2))
 	userAction := Decode(FirstBytes(action, 1))
@@ -137,7 +137,7 @@ func TestEncodeAgentRequestCarriesImages(t *testing.T) {
 // 没有图片时结构要和以前一致：字段 3 存在但为空。
 // 早期版本这里发的是空字符串，改成空消息后行为等价，别回退成不发。
 func TestEncodeAgentRequestWithoutImages(t *testing.T) {
-	top := Decode(EncodeAgentRequest([]types.Message{{Role: "user", Content: "hi"}}, "auto"))
+	top := Decode(EncodeAgentRequest([]types.Message{{Role: "user", Content: "hi"}}, "auto", ModeAgent))
 	runReq := Decode(FirstBytes(top, 1))
 	action := Decode(FirstBytes(runReq, 2))
 	userAction := Decode(FirstBytes(action, 1))
@@ -148,5 +148,33 @@ func TestEncodeAgentRequestWithoutImages(t *testing.T) {
 	}
 	if len(FirstBytes(userMsg, 3)) != 0 {
 		t.Fatal("没有图片时字段 3 应为空")
+	}
+}
+
+// mode 决定上游按 agent 还是纯问答行事。纯对话用 ASK 能让模型直接作答，
+// 不再把内容塞进「写文件」调用；声明了工具时必须留在 agent 模式。
+func TestEncodeAgentRequestMode(t *testing.T) {
+	userMessageOf := func(raw []byte) map[int][]Field {
+		top := Decode(raw)
+		runReq := Decode(FirstBytes(top, 1))
+		action := Decode(FirstBytes(runReq, 2))
+		userAction := Decode(FirstBytes(action, 1))
+		return Decode(FirstBytes(userAction, 1))
+	}
+	msgs := []types.Message{{Role: "user", Content: "hi"}}
+
+	for _, tc := range []struct {
+		mode Mode
+		want uint64
+	}{{ModeAsk, 2}, {ModeAgent, 1}} {
+		um := userMessageOf(EncodeAgentRequest(msgs, "auto", tc.mode))
+		if len(um[4]) == 0 || um[4][0].Varint != tc.want {
+			t.Fatalf("mode %d 应写入字段 4 的值 %d，实际 %+v", tc.mode, tc.want, um[4])
+		}
+	}
+
+	// 不指定时不写该字段，保持上游默认行为
+	if um := userMessageOf(EncodeAgentRequest(msgs, "auto", ModeUnspecified)); len(um[4]) != 0 {
+		t.Fatal("未指定模式时不应写入字段 4")
 	}
 }

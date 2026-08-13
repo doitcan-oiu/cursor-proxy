@@ -51,6 +51,12 @@ type Config struct {
 	IMAPHost          string
 	IMAPPort          int
 
+	// AskMode 决定纯对话（客户端没声明工具）时是否让上游走 ASK 模式。
+	// 开启后模型直接作答，不再把内容塞进「写文件」调用再由本代理还原。
+	// 代价是提示词像「Create a file…」时，模型有时会先说一句自己处于 Ask 模式。
+	// 设 ASK_MODE=off 可退回原来的 agent 行为。
+	AskMode bool
+
 	// TokenizerMode 决定 usage 的 token 如何计算：
 	// "bpe"（默认）用内嵌词表精确分词；"estimate" 关闭分词器改用启发式，省约 7MB 内存。
 	TokenizerMode string
@@ -120,6 +126,7 @@ func Get() *Config {
 			MailCodeTimeoutMs:   envInt("MAIL_CODE_TIMEOUT_MS", 120000),
 			IMAPHost:            envStr("IMAP_HOST", ""),
 			IMAPPort:            envInt("IMAP_PORT", 993),
+			AskMode:             envStr("ASK_MODE", "on") != "off",
 			TokenizerMode:       envStr("TOKENIZER", "bpe"),
 			Antiban: Antiban{
 				MinIntervalMs:          envInt("ACCOUNT_MIN_INTERVAL_MS", 0),

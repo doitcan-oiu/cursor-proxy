@@ -234,7 +234,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	keyPrefix := keyPrefixFromAuth(r)
 	promptTokens := tokenize.CountMessages(body.Model, messages)
 
-	opened, uerr := OpenWithFailover(messages, body.Model)
+	opened, uerr := OpenWithFailover(messages, body.Model, ModeFor(len(toolDefs)))
 	if uerr != nil {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Stream: body.Stream, KeyPrefix: keyPrefix,
 			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(), Error: trunc(uerr.Msg, 200)})

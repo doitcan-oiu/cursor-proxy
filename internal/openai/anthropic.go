@@ -236,7 +236,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	keyPrefix := anthropicKeyPrefix(r)
 	inputTokens := tokenize.CountMessages(model, messages)
 
-	opened, uerr := OpenWithFailover(messages, model)
+	opened, uerr := OpenWithFailover(messages, model, ModeFor(len(toolDefs)))
 	if uerr != nil {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, KeyPrefix: keyPrefix, Stream: body.Stream,
 			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(), Error: trunc(uerr.Msg, 200)})

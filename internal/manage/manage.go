@@ -9,6 +9,7 @@ import (
 	"cursor-proxy/internal/auth"
 	"cursor-proxy/internal/config"
 	"cursor-proxy/internal/cursor"
+	"cursor-proxy/internal/proto"
 	"cursor-proxy/internal/reqlog"
 	"cursor-proxy/internal/tools"
 	"cursor-proxy/internal/types"
@@ -222,6 +223,14 @@ func ListModels() []cursor.AgentModel {
 	return []cursor.AgentModel{}
 }
 
+// askMode 调试台永远是纯对话，除非用户显式关掉 ASK 模式。
+func askMode() proto.Mode {
+	if config.Get().AskMode {
+		return proto.ModeAsk
+	}
+	return proto.ModeAgent
+}
+
 // TestChatResult 测试对话结果。
 type TestChatResult struct {
 	OK        bool   `json:"ok"`
@@ -265,7 +274,7 @@ func TestChat(req TestChatRequest) TestChatResult {
 		return TestChatResult{Error: "图片无法解析: " + skipped}
 	}
 	ctx := cursor.BuildContext(entry.ID, entry.Token, true)
-	stream, err := cursor.StreamAgent(msgs, cursor.ResolveUpstreamModel(req.Model), ctx.Bearer, ctx.ProxyURL)
+	stream, err := cursor.StreamAgent(msgs, cursor.ResolveUpstreamModel(req.Model), ctx.Bearer, ctx.ProxyURL, askMode())
 	if err != nil {
 		return TestChatResult{Error: err.Error()}
 	}
@@ -309,7 +318,7 @@ func TestChatStream(req TestChatRequest, onDelta func(TestDelta)) bool {
 	}
 	ctx := cursor.BuildContext(entry.ID, entry.Token, true)
 	stream, err := cursor.StreamAgent(msgs,
-		cursor.ResolveUpstreamModel(req.Model), ctx.Bearer, ctx.ProxyURL)
+		cursor.ResolveUpstreamModel(req.Model), ctx.Bearer, ctx.ProxyURL, askMode())
 	if err != nil {
 		onDelta(TestDelta{Error: err.Error()})
 		return false

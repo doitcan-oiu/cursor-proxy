@@ -246,6 +246,26 @@ SelectedImage.2/3  = uuid / path
 只回一句「我没有这个工具」。改成只改写 `Content` 字段后，
 「读发票图 → 调用 record_invoice 工具」这条链路才跑通。
 
+### ~~P1：以为上游没有 ask 模式，纯对话被迫走「写文件再还原」~~（已在 Go 版修复）
+早期结论是「上游始终是 agent 形态，没有纯问答模式」，于是纯对话里问「写一段 SVG」
+只能先接住写文件调用、再把内容还原成代码块。
+
+从 Cursor 客户端自带的描述里可以看到这个结论是错的：
+
+```
+agent.v1.AgentMode = { 0:UNSPECIFIED, 1:AGENT, 2:ASK, 3:PLAN,
+                       4:DEBUG, 5:TRIAGE, 6:PROJECT, 7:MULTITASK, 8:CUSTOM }
+agent.v1.UserMessage.4 = mode
+```
+
+改为按客户端是否声明工具自动切换：没声明 `tools` 用 ASK（模型直接作答），
+声明了用 AGENT（内置工具桥接照常）。实测同一个 SVG 提示词，ASK 模式下
+472 块纯文本流式，不再绕道写文件；「写个 Python 快排」直接给代码块。
+
+已知代价：提示词带「Create a file…」字样时模型有时会先说一句
+「I'm currently in Ask mode…」。试过用 `AgentRunRequest.8 = custom_system_prompt`
+压掉这句，上游返回 `invalid_argument`，这条路走不通。留了 `ASK_MODE=off` 作退路。
+
 ### P2：`checkAllAccounts` / 批量验号会打真实计费请求
 `get-current-period-usage` 和 `full_stripe_profile` 每次验号都会请求 Cursor 官方接口。账号多时
 一轮全量验号是几十上百个外部请求，且无缓存。建议对 plan/usage 结果做短 TTL 缓存（如 5 分钟），

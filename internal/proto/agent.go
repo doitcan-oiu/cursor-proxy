@@ -93,13 +93,28 @@ func extForMime(mime string) string {
 	}
 }
 
+// Mode 对应上游的 agent.v1.AgentMode 枚举。
+type Mode int
+
+const (
+	// ModeUnspecified 不指定，由上游决定（历史行为）。
+	ModeUnspecified Mode = 0
+	// ModeAgent 让上游按 agent 行事：可以调用内置工具。
+	ModeAgent Mode = 1
+	// ModeAsk 纯问答：模型直接作答，不会把内容塞进「写文件」调用。
+	ModeAsk Mode = 2
+)
+
 // EncodeAgentRequest 构造 agentn.api5 的 AgentClientMessage/AgentRunRequest（未加 Connect 信封）。
-func EncodeAgentRequest(messages []types.Message, modelID string) []byte {
+func EncodeAgentRequest(messages []types.Message, modelID string, mode Mode) []byte {
 	userMsg := NewWriter()
 	userMsg.Str(1, BuildPrompt(messages))
 	userMsg.Str(2, uuid.NewString())
 	// 字段 3 是 SelectedContext。没有图片时发空消息，行为与之前一致。
 	userMsg.Bytes(3, encodeSelectedImages(types.CollectImages(messages)))
+	if mode != ModeUnspecified {
+		userMsg.Int32(4, int(mode))
+	}
 
 	// ExplicitContext 是必填的：完全省略这个字段时上游会接受请求但一个字都不生成。
 	// 这里给一个空上下文，避免伪造文件让 agent 以为身处代码工作区。

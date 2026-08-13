@@ -157,9 +157,11 @@ func (s *AgentStream) Close() {
 //
 // 收尾优先看 Connect 的 end-of-stream 帧，拿到即立刻结束；
 // 空闲超时只作为上游不发该帧时的兜底。
-func StreamAgent(messages []types.Message, modelID, token, proxyURL string) (*AgentStream, error) {
+//
+// mode 决定上游按 agent 还是纯问答行事，见 AskMode / AgentMode。
+func StreamAgent(messages []types.Message, modelID, token, proxyURL string, mode proto.Mode) (*AgentStream, error) {
 	bearer := auth.ExtractBearer(token)
-	body := connectFrame(proto.EncodeAgentRequest(messages, modelID))
+	body := connectFrame(proto.EncodeAgentRequest(messages, modelID, mode))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, runURL(), strings.NewReader(string(body)))

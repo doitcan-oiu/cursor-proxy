@@ -7,6 +7,7 @@ import (
 
 	"cursor-proxy/internal/config"
 	"cursor-proxy/internal/cursor"
+	"cursor-proxy/internal/proto"
 	"cursor-proxy/internal/types"
 )
 
@@ -42,8 +43,20 @@ func backoff(attempt int) {
 	time.Sleep(d)
 }
 
+// ModeFor 按客户端是否声明工具挑选上游模式。
+//
+// 上游默认按 agent 行事：即便对话里没有任何工具，问它「写一段 SVG」它也会把内容
+// 塞进一次「写文件」调用，得再还原成正文。纯对话场景改用 ASK 模式后，模型直接作答，
+// 少一层来回。声明了工具的客户端必须留在 agent 模式，否则内置工具桥接就没得桥了。
+func ModeFor(toolCount int) proto.Mode {
+	if toolCount > 0 || !config.Get().AskMode {
+		return proto.ModeAgent
+	}
+	return proto.ModeAsk
+}
+
 // OpenWithFailover 带故障转移地打开对话流：先探帧，拿到正文前出错则换号重试。
-func OpenWithFailover(messages []types.Message, model string) (*OpenedStream, *cursor.UpstreamError) {
+func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (*OpenedStream, *cursor.UpstreamError) {
 	ab := config.Get().Antiban
 	exclude := map[string]bool{}
 	var lastErr *cursor.UpstreamError
@@ -55,7 +68,7 @@ func OpenWithFailover(messages []types.Message, model string) (*OpenedStream, *c
 			break
 		}
 
-		stream, err := cursor.StreamAgent(messages, upstreamModel, account.Bearer, account.ProxyURL)
+		stream, err := cursor.StreamAgent(messages, upstreamModel, account.Bearer, account.ProxyURL, mode)
 		if err != nil {
 			status := 0
 			if aerr, ok := err.(*cursor.AgentUpstreamError); ok {
