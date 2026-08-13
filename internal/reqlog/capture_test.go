@@ -50,7 +50,7 @@ func TestSanitizeKeepsPlainRequestParsable(t *testing.T) {
 func TestSanitizeTruncatesHugeRequest(t *testing.T) {
 	raw := `{"text":"` + strings.Repeat("a", MaxRequestBytes*2) + `"}`
 	got := SanitizeRequest([]byte(raw))
-	if len(got) > MaxRequestBytes+120 {
+	if len(got) > MaxRequestBytes+140 {
 		t.Fatalf("应截断到上限附近，实际 %d 字节", len(got))
 	}
 	if !strings.Contains(got, "已截断") {

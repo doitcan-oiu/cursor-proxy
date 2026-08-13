@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"cursor-proxy/internal/config"
 	"cursor-proxy/internal/proto"
 )
 
@@ -883,4 +884,142 @@ func TestCompletedToolIsNotReportedAsUnfinished(t *testing.T) {
 			t.Fatalf("已完成的调用不应被报成未完成：%q", ev.Text)
 		}
 	}
+}
+
+// heartbeatOnlyBody 先只发心跳，过一会儿才吐正文。
+// 复刻 claude-fable-5-max 处理长多轮对话时的真实行为：
+// 连发 6 次心跳、思考 64 秒才出第一个字。
+type heartbeatOnlyBody struct {
+	silence  time.Duration
+	tail     []byte
+	started  time.Time
+	sent     bool
+	done     chan struct{}
+	closeOne sync.Once
+}
+
+func (b *heartbeatOnlyBody) Read(p []byte) (int, error) {
+	if b.started.IsZero() {
+		b.started = time.Now()
+	}
+	if time.Since(b.started) >= b.silence && !b.sent {
+		b.sent = true
+		return copy(p, b.tail), nil
+	}
+	select {
+	case <-b.done:
+		return 0, io.EOF
+	case <-time.After(150 * time.Millisecond):
+		return copy(p, heartbeatFrame()), nil
+	}
+}
+
+func (b *heartbeatOnlyBody) Close() error {
+	b.closeOne.Do(func() { close(b.done) })
+	return nil
+}
+
+// 只要还有心跳就说明线路通、模型在想，不能按「出口不通」掐掉。
+// 早期把这种情况也算首字超时，等于在内容到达前放弃，还要换号重试一遍。
+func TestHeartbeatsKeepStreamAliveWhileThinking(t *testing.T) {
+	t.Setenv("AGENT_FIRST_TOKEN_MS", "200")
+	t.Setenv("AGENT_THINKING_MS", "10000")
+	t.Setenv("AGENT_IDLE_MS", "80")
+	t.Setenv("AGENT_FINISH_IDLE_MS", "60")
+	config.Reset()
+	defer restoreEnv(t)
+
+	var tail []byte
+	tail = append(tail, contentFrame("想好了")...)
+	tail = append(tail, conversationFrame(4)...)
+	body := &heartbeatOnlyBody{silence: 700 * time.Millisecond, tail: tail, done: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var text, errMsg string
+	for ev := range events {
+		switch ev.Kind {
+		case EventDelta:
+			text += ev.Text
+		case EventError:
+			errMsg = ev.Message
+		}
+	}
+	if errMsg != "" {
+		t.Fatalf("有心跳就不该报错，实际 %q", errMsg)
+	}
+	if text != "想好了" {
+		t.Fatalf("应等到正文，实际 %q", text)
+	}
+}
+
+// 思考也不能无限等：超过 AGENT_THINKING_MS 要给一个说清原因的错误，
+// 而不是继续甩锅给出口节点。
+func TestThinkingBudgetGivesAccurateError(t *testing.T) {
+	t.Setenv("AGENT_FIRST_TOKEN_MS", "200")
+	t.Setenv("AGENT_THINKING_MS", "400")
+	t.Setenv("AGENT_IDLE_MS", "80")
+	t.Setenv("AGENT_FINISH_IDLE_MS", "60")
+	config.Reset()
+	defer restoreEnv(t)
+
+	body := &heartbeatOnlyBody{silence: time.Hour, done: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	errMsg := ""
+	for ev := range events {
+		if ev.Kind == EventError {
+			errMsg = ev.Message
+		}
+	}
+	if !strings.Contains(errMsg, "模型思考") {
+		t.Fatalf("应说明是模型思考太久，实际 %q", errMsg)
+	}
+	if strings.Contains(errMsg, "出口节点") {
+		t.Fatalf("有心跳时不该甩锅给出口节点：%q", errMsg)
+	}
+}
+
+// 一帧都没有才是线路问题，这时的文案仍应指向出口节点。
+func TestNoFrameAtAllStillBlamesRoute(t *testing.T) {
+	t.Setenv("AGENT_FIRST_TOKEN_MS", "200")
+	t.Setenv("AGENT_IDLE_MS", "80")
+	config.Reset()
+	defer restoreEnv(t)
+
+	body := &heldOpenBody{release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	errMsg := ""
+	for ev := range events {
+		if ev.Kind == EventError {
+			errMsg = ev.Message
+		}
+	}
+	if !strings.Contains(errMsg, "出口节点") {
+		t.Fatalf("一帧都没有时应指向线路问题，实际 %q", errMsg)
+	}
+}
+
+// restoreEnv 把超时相关的环境变量恢复成默认，避免影响后续用例。
+func restoreEnv(t *testing.T) {
+	for _, k := range []string{"AGENT_FIRST_TOKEN_MS", "AGENT_THINKING_MS",
+		"AGENT_IDLE_MS", "AGENT_FINISH_IDLE_MS"} {
+		t.Setenv(k, "")
+	}
+	config.Reset()
 }

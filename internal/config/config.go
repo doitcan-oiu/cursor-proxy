@@ -52,8 +52,14 @@ type Config struct {
 	// AgentHardCapMs 是单轮对话的时长兜底，防的是「一直吐、永远不停」的失控流。
 	// 卡住的流由 AgentIdleMs 负责，所以这里给得很宽：早期默认 180s，
 	// 结果长文写到一半（约 1.5 万字）就被静默掐断，还报成正常结束。
-	AgentHardCapMs    int
+	AgentHardCapMs int
+	// AgentFirstTokenMs 是「一帧都没收到」的容忍上限。
+	// 只在连心跳都没有时生效，这种情况基本可以判定线路不通。
 	AgentFirstTokenMs int
+	// AgentThinkingMs 是「心跳正常但还没吐字」的容忍上限。
+	// -max 系列模型处理长的多轮工具对话时，思考一两分钟很常见；
+	// 早期把这种情况也按首字超时掐掉（60s），等于在内容到达前放弃。
+	AgentThinkingMs int
 
 	LoginHeadless     bool
 	LoginTimeoutMs    int
@@ -147,6 +153,7 @@ func Get() *Config {
 			AgentFinishIdleMs:   envInt("AGENT_FINISH_IDLE_MS", 400),
 			AgentHardCapMs:      envInt("AGENT_HARD_CAP_MS", 1800000),
 			AgentFirstTokenMs:   envInt("AGENT_FIRST_TOKEN_MS", 60000),
+			AgentThinkingMs:     envInt("AGENT_THINKING_MS", 600000),
 			LoginHeadless:       envStr("CURSOR_LOGIN_HEADLESS", "true") != "false",
 			LoginTimeoutMs:      envInt("ACCOUNT_LOGIN_TIMEOUT_MS", 180000),
 			MailCodeTimeoutMs:   envInt("MAIL_CODE_TIMEOUT_MS", 120000),

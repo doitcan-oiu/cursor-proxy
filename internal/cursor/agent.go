@@ -201,6 +201,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 	idle := time.Duration(cfg.AgentIdleMs) * time.Millisecond
 	finishIdle := time.Duration(cfg.AgentFinishIdleMs) * time.Millisecond
 	hardCap := hardCapFor()
+	thinking := time.Duration(cfg.AgentThinkingMs) * time.Millisecond
 	firstToken := time.Duration(cfg.AgentFirstTokenMs) * time.Millisecond
 	start := time.Now()
 
@@ -271,15 +272,34 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 				state.finish(send, false)
 				return
 			}
+			// 收到过帧（哪怕只是每 10s 一次的心跳）就说明线路是通的、模型还在想，
+			// 不能按「出口不通」处理。实测 claude-fable-5-max 处理长的多轮工具对话时
+			// 会连发 6 次心跳、思考 64 秒才吐第一个字——按 60s 首字超时掐掉，
+			// 等于在内容到达前 6 秒放弃，还要换号重试一遍，白等两倍时间。
+			if state.sawFrame {
+				if time.Since(start) > thinking {
+					state.errored = true
+					send(StreamEvent{Kind: EventError, Message: fmt.Sprintf(
+						"模型思考超过 %ds 仍未产出正文（期间连接正常、上游一直在发心跳）。"+
+							"这类长耗时多见于 -max 系列模型处理长对话，可换用更快的模型，"+
+							"或调大 AGENT_THINKING_MS。", cfg.AgentThinkingMs/1000)})
+					return
+				}
+				continue
+			}
 			if time.Since(start) > firstToken {
 				state.errored = true
 				send(StreamEvent{Kind: EventError, Message: fmt.Sprintf(
-					"上游 %ds 未返回任何内容：出口节点可能不通或该模型在当前出口区域不可用。请在界面切换 VPN 节点后重试，或改用 auto 等可用模型。",
+					"上游 %ds 内一帧都没发（连心跳都没有）：出口节点可能不通或该模型在当前出口区域不可用。请在界面切换 VPN 节点后重试，或改用 auto 等可用模型。",
 					cfg.AgentFirstTokenMs/1000)})
 				return
 			}
 			continue
 		case ch := <-chunks:
+			// 收到任何字节都算「线路是通的」，哪怕只是心跳
+			if len(ch.data) > 0 {
+				state.sawFrame = true
+			}
 			if ch.err != nil {
 				if !state.errored && ch.err != io.EOF && !state.gotContent && !state.turnComplete {
 					send(StreamEvent{Kind: EventError, Message: ch.err.Error()})
@@ -702,6 +722,9 @@ func isPrintableText(s string) bool {
 // agentStreamState 跟踪一次流的解析状态。
 type agentStreamState struct {
 	gotContent bool // 是否已产出过正文
+	// sawFrame 表示收到过上游的字节（含心跳）。
+	// 用来区分「线路不通」和「模型在慢慢想」——两者的等待预算完全不同。
+	sawFrame bool
 	// textBytes 累计产出的正文字节数，仅用于截断时的日志。
 	textBytes int
 	errored   bool // 是否已下发过错误
