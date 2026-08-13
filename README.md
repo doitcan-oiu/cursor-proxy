@@ -122,7 +122,7 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 | `glob` (4) | `glob` / `file_search` / `find_files` … |
 | `grep` (5) | `grep` / `search` / `ripgrep` … |
 | `read` (8) | `read` / `view_file` / `cat` … |
-| `update_todos` (9) | `TodoWrite` / `todos` / `update_plan` …（合成 todos 数组） |
+| `update_todos` (9) | `TodoWrite` / `todos` / `update_plan` …（按客户端 schema 合成数组） |
 | `edit` (12) | `write` / `edit` / `create_file` … |
 | `ls` (13) | `ls` / `list_dir` / `list_directory` … |
 | `web_search` (18) | `web_search` / `search_web` … |
@@ -144,6 +144,12 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 
 补映射时把字段号与参数结构填进 `internal/cursor/agent.go` 的 `toolParsers`
 和 `internal/tools/bridge.go` 的 `candidateNames` 即可，各加一行。
+
+**待办清单按客户端声明的 schema 生成**，不写死字段。各家要求并不一致：
+OpenCode 的 `todowrite` 要求 `content` / `status` / `priority` 三个全填、且没有 `id`，
+缺一个就报 `SchemaError(Missing key at ["todos"][0]["priority"])` 让整个调用作废；
+Claude Code 的 `TodoWrite` 要的则是 `activeForm`。代理会读取工具的 items schema，
+只填它声明过的字段，认不出来但必填的字段按类型补占位值。
 
 **工具宣告了却没做完**：上游偶尔只发一个「进行中」帧宣告要用某工具，
 然后既不给参数也不发完成帧（实测 `web_search` 就是这样，参数长度 0）。

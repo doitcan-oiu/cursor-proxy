@@ -408,6 +408,24 @@ same tools again.`。
 收到过心跳就说明模型在想，改用 `AGENT_THINKING_MS`（默认 600s），
 超时文案也明确说明是思考太久、连接正常。修复后同一个请求首字 70.5s 到达并正常完成。
 
+### ~~P1：待办清单调用被客户端 schema 校验打回~~（已在 Go 版修复）
+把上游的 `update_todos` 映射成客户端工具时，参数写死成 `id/content/status`。
+接 OpenCode 实测每次都失败：
+
+```
+✗ Todos failed
+Error: The todowrite tool was called with invalid arguments:
+  SchemaError(Missing key at ["todos"][0]["priority"]).
+```
+
+抓它发来的 schema 才看清，`content` / `status` / `priority` 三个全是必填，
+而且根本没有 `id` 字段。各家客户端要求还不一样——Claude Code 的 `TodoWrite`
+要的是 `activeForm`。写死任何一套都会在别家翻车。
+
+改成读取工具的 items schema 按需生成：只填它声明过的字段，
+`priority` 这类上游没有的给中性默认值，认不出来但必填的按类型补占位值，
+schema 缺失时退回到通用三字段。改完后 OpenCode 里待办正常渲染，不再报错。
+
 ### P2：`checkAllAccounts` / 批量验号会打真实计费请求
 `get-current-period-usage` 和 `full_stripe_profile` 每次验号都会请求 Cursor 官方接口。账号多时
 一轮全量验号是几十上百个外部请求，且无缓存。建议对 plan/usage 结果做短 TTL 缓存（如 5 分钟），

@@ -131,24 +131,55 @@ var candidateParams = map[NativeKind][]string{
 	KindUpdateTodos: {"todos", "items", "tasks", "todo_list", "plan"},
 }
 
-// todoCall 把待办清单合成成客户端声明的待办工具调用。
-// 这类工具的参数是对象数组，走不了通用的「单值填一个属性」那套。
-func todoCall(n Native, def Definition) (Call, bool) {
-	items := make([]map[string]any, 0, len(n.Todos))
-	for i, t := range n.Todos {
-		id := t.ID
-		if id == "" {
-			id = strconv.Itoa(i + 1)
-		}
-		items = append(items, map[string]any{
-			"id": id, "content": t.Content, "status": t.Status,
-		})
-	}
+// itemSchema 是待办条目的 JSON Schema 片段（只取用得上的部分）。
+type itemSchema struct {
+	Properties map[string]struct {
+		Type        string `json:"type"`
+		Description string `json:"description"`
+	} `json:"properties"`
+	Required []string `json:"required"`
+}
 
+// todoItemSchema 从客户端声明的参数里取出「数组元素」的 schema。
+// 拿不到就返回零值，调用方退回到只填我们已知的字段。
+func todoItemSchema(def Definition, key string) itemSchema {
+	var root struct {
+		Properties map[string]struct {
+			Items json.RawMessage `json:"items"`
+		} `json:"properties"`
+	}
+	if json.Unmarshal(def.Parameters, &root) != nil {
+		return itemSchema{}
+	}
+	raw := root.Properties[key].Items
+	if len(raw) == 0 {
+		return itemSchema{}
+	}
+	var s itemSchema
+	if json.Unmarshal(raw, &s) != nil {
+		return itemSchema{}
+	}
+	return s
+}
+
+// todoCall 把待办清单合成成客户端声明的待办工具调用。
+//
+// 这类工具的参数是对象数组，走不了通用的「单值填一个属性」那套；而且各家客户端
+// 要求的字段并不一致——OpenCode 的 todowrite 三个字段 content/status/priority
+// 全是必填，缺一个就报 SchemaError 整个调用作废，且它没有 id 字段。
+// 所以这里照客户端声明的 schema 生成，而不是写死一套字段。
+func todoCall(n Native, def Definition) (Call, bool) {
 	key := "todos"
 	if k, ok := matchParam(KindUpdateTodos, def); ok {
 		key = k
 	}
+	schema := todoItemSchema(def, key)
+
+	items := make([]map[string]any, 0, len(n.Todos))
+	for i, t := range n.Todos {
+		items = append(items, todoItem(t, i, schema))
+	}
+
 	raw, err := json.Marshal(map[string]any{key: items})
 	if err != nil {
 		return Call{}, false
@@ -158,6 +189,61 @@ func todoCall(n Native, def Definition) (Call, bool) {
 		id = NewCallID()
 	}
 	return Call{ID: id, Name: def.Name, Arguments: string(raw)}, true
+}
+
+// todoItem 按 schema 生成一条待办。schema 缺失时退回到通用的三个字段。
+func todoItem(t TodoItem, index int, schema itemSchema) map[string]any {
+	id := t.ID
+	if id == "" {
+		id = strconv.Itoa(index + 1)
+	}
+	known := map[string]any{
+		"content": t.Content,
+		"status":  t.Status,
+		"id":      id,
+		// 上游不提供优先级，给个中性值即可，重点是别让必填字段缺失
+		"priority": "medium",
+		// Claude Code 的 TodoWrite 要求这个字段，用来显示「正在做什么」
+		"activeform": t.Content,
+	}
+
+	if len(schema.Properties) == 0 {
+		return map[string]any{"id": id, "content": t.Content, "status": t.Status}
+	}
+
+	required := map[string]bool{}
+	for _, r := range schema.Required {
+		required[r] = true
+	}
+
+	item := map[string]any{}
+	for name, spec := range schema.Properties {
+		if v, ok := known[strings.ToLower(name)]; ok {
+			item[name] = v
+			continue
+		}
+		// 不认识但必填的字段也要给个值，否则整个调用会被 schema 校验打回
+		if required[name] {
+			item[name] = zeroValue(spec.Type)
+		}
+	}
+	return item
+}
+
+// zeroValue 按 JSON Schema 的类型给一个占位值。
+func zeroValue(typ string) any {
+	switch typ {
+	case "integer", "number":
+		return 0
+	case "boolean":
+		return false
+	case "array":
+		return []any{}
+	case "object":
+		return map[string]any{}
+	default:
+		return ""
+	}
 }
 
 // MapNative 把一次上游内置调用映射成客户端声明的工具调用。

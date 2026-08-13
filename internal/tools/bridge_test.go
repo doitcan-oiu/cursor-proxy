@@ -320,3 +320,119 @@ func TestSystemPromptDoesNotDenyBuiltinTools(t *testing.T) {
 		t.Fatalf("提醒语同样不应否认内置工具：%s", Reminder())
 	}
 }
+
+// OpenCode 的 todowrite 三个字段全是必填，缺 priority 会被 schema 校验打回：
+// SchemaError(Missing key at ["todos"][0]["priority"])，整个调用作废。
+// 而且它没有 id 字段，多塞也没意义。所以要照客户端声明的 schema 生成。
+func TestTodoCallMatchesOpenCodeSchema(t *testing.T) {
+	defs := []Definition{{
+		Name: "todowrite",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array",
+			"items":{"type":"object","properties":{
+				"content":{"type":"string"},
+				"status":{"type":"string"},
+				"priority":{"type":"string","description":"high, medium, low"}},
+			"required":["content","status","priority"]}}},"required":["todos"]}`),
+	}}
+	n := Native{ID: "c1", Kind: KindUpdateTodos, Todos: []TodoItem{
+		{ID: "1", Content: "调研", Status: "in_progress"},
+	}}
+
+	call, ok := MapNative(n, defs)
+	if !ok {
+		t.Fatal("应能映射到 todowrite")
+	}
+	var got struct {
+		Todos []map[string]any `json:"todos"`
+	}
+	if err := json.Unmarshal([]byte(call.Arguments), &got); err != nil {
+		t.Fatalf("参数应是合法 JSON：%v", err)
+	}
+	if len(got.Todos) != 1 {
+		t.Fatalf("应有 1 条待办，实际 %d", len(got.Todos))
+	}
+	item := got.Todos[0]
+	for _, k := range []string{"content", "status", "priority"} {
+		if v, ok := item[k]; !ok || v == "" {
+			t.Fatalf("必填字段 %q 不能缺失或为空：%v", k, item)
+		}
+	}
+	if _, ok := item["id"]; ok {
+		t.Fatalf("schema 没声明 id 就不该塞：%v", item)
+	}
+	if item["priority"] != "medium" {
+		t.Fatalf("优先级应给中性默认值，实际 %v", item["priority"])
+	}
+}
+
+// Claude Code 的 TodoWrite 要求 activeForm 而不是 priority，
+// 同一套逻辑要能照它的 schema 生成。
+func TestTodoCallMatchesClaudeCodeSchema(t *testing.T) {
+	defs := []Definition{{
+		Name: "TodoWrite",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array",
+			"items":{"type":"object","properties":{
+				"content":{"type":"string"},
+				"status":{"type":"string"},
+				"activeForm":{"type":"string"}},
+			"required":["content","status","activeForm"]}}},"required":["todos"]}`),
+	}}
+	call, ok := MapNative(Native{Kind: KindUpdateTodos,
+		Todos: []TodoItem{{Content: "起草", Status: "pending"}}}, defs)
+	if !ok {
+		t.Fatal("应能映射")
+	}
+	var got struct {
+		Todos []map[string]any `json:"todos"`
+	}
+	_ = json.Unmarshal([]byte(call.Arguments), &got)
+	if got.Todos[0]["activeForm"] != "起草" {
+		t.Fatalf("activeForm 应有值：%v", got.Todos[0])
+	}
+	if _, ok := got.Todos[0]["priority"]; ok {
+		t.Fatalf("这个 schema 没有 priority，不该塞：%v", got.Todos[0])
+	}
+}
+
+// 认不出来但必填的字段也要给占位值，否则整个调用会被校验打回。
+func TestTodoCallFillsUnknownRequiredFields(t *testing.T) {
+	defs := []Definition{{
+		Name: "todowrite",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array",
+			"items":{"type":"object","properties":{
+				"content":{"type":"string"},
+				"status":{"type":"string"},
+				"weight":{"type":"integer"},
+				"pinned":{"type":"boolean"}},
+			"required":["content","status","weight","pinned"]}}}}`),
+	}}
+	call, _ := MapNative(Native{Kind: KindUpdateTodos,
+		Todos: []TodoItem{{Content: "x", Status: "pending"}}}, defs)
+	var got struct {
+		Todos []map[string]any `json:"todos"`
+	}
+	_ = json.Unmarshal([]byte(call.Arguments), &got)
+	item := got.Todos[0]
+	if _, ok := item["weight"]; !ok {
+		t.Fatalf("未知必填字段应补占位值：%v", item)
+	}
+	if item["pinned"] != false {
+		t.Fatalf("布尔占位应为 false，实际 %v", item["pinned"])
+	}
+}
+
+// 客户端没给 items schema 时退回到通用的三个字段，不能整个失败。
+func TestTodoCallFallsBackWithoutSchema(t *testing.T) {
+	defs := []Definition{{
+		Name:       "todos",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array"}}}`),
+	}}
+	call, ok := MapNative(Native{Kind: KindUpdateTodos,
+		Todos: []TodoItem{{Content: "x", Status: "pending"}}}, defs)
+	if !ok {
+		t.Fatal("没有 items schema 也应能映射")
+	}
+	if !strings.Contains(call.Arguments, `"content":"x"`) {
+		t.Fatalf("应保留基本字段：%s", call.Arguments)
+	}
+}
