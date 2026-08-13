@@ -352,15 +352,26 @@ func (s *agentStreamState) finish(send func(StreamEvent) bool, truncated bool) {
 	if s.errored {
 		return
 	}
-	for id, kind := range s.announced {
+
+	// 只有「这一轮什么都没产出」时才需要解释。
+	//
+	// 模型宣告了工具又放弃是很常见的——它想了想改主意了，或者同一次调用先被
+	// 宣告、后来换了个 id 重发。只要这一轮给出了正文或完成了别的工具调用，
+	// 这种半途而废就是无害的中间状态，不该报警，更不该往用户的回复里插说明文字。
+	// 早期不加区分，实测十小时内插了 33 次，绝大多数所在的轮次其实好好的。
+	if s.gotContent || s.sawToolCall {
+		send(StreamEvent{Kind: EventEnd, Truncated: truncated})
+		return
+	}
+
+	for id, name := range s.announced {
 		if s.emitted[id] {
 			continue
 		}
-		name := string(kind)
 		if name == "" {
 			name = "未知"
 		}
-		log.Printf("[cursor] 上游宣告了工具 %s 却没有下发参数，本轮可能未完成", name)
+		log.Printf("[cursor] 上游宣告了工具 %s 却没有下发参数，且本轮没有任何产出", name)
 		if !send(StreamEvent{Kind: EventDelta, Text: fmt.Sprintf(
 			"\n\n（上游想调用内置工具 %s，但没有给出参数，本轮就此结束。"+
 				"该工具可能在当前账号或模型下不可用。）", name)}) {
@@ -372,27 +383,27 @@ func (s *agentStreamState) finish(send func(StreamEvent) bool, truncated bool) {
 
 // parseToolProgress 从「进行中」帧里取出调用 id、工具类型与已知路径。
 // 参数还没发完，但类型和路径先到，足以判断后续片段要不要流式输出。
-func parseToolProgress(sm map[int][]proto.Field) (id string, kind NativeToolKind, path string, ok bool) {
+func parseToolProgress(sm map[int][]proto.Field) (id string, kind NativeToolKind, path string, field int, ok bool) {
 	body := proto.FirstBytes(sm, smToolCallProgress)
 	if body == nil {
-		return "", "", "", false
+		return "", "", "", 0, false
 	}
 	f := proto.Decode(body)
 	id = proto.FirstString(f, 1)
 	wrapper := proto.FirstBytes(f, 2)
 	if id == "" || wrapper == nil {
-		return "", "", "", false
+		return "", "", "", 0, false
 	}
 	w := proto.Decode(wrapper)
-	for field, kindOf := range toolKinds {
-		if body := proto.FirstBytes(w, field); body != nil {
-			if inner := proto.FirstBytes(proto.Decode(body), 1); inner != nil {
-				path = proto.FirstString(proto.Decode(inner), 1)
-			}
-			return id, kindOf, path, true
-		}
+	field, body = firstToolField(w)
+	if field == 0 {
+		return id, "", "", 0, true
 	}
-	return id, "", "", true
+	if inner := proto.FirstBytes(proto.Decode(body), 1); inner != nil {
+		path = proto.FirstString(proto.Decode(inner), 1)
+	}
+	// toolKinds 里没有的工具照样把字段号带出去，日志里就能报出规范名
+	return id, toolKinds[field], path, field, true
 }
 
 // parseToolInputDelta 取出参数的流式文本片段。
@@ -523,39 +534,57 @@ func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
 	// 按字段号查表解析。早期是一串 if，字段号靠抓帧猜，出过两次错
 	// （4 当成 ls 其实是 glob、23 当成 todo 其实是 ask_question），
 	// 改成查表后加工具只需加一行，也不会再受判断顺序影响。
-	for field, parse := range toolParsers {
-		a := args(field)
-		if a == nil {
-			continue
-		}
-		call := parse(a)
-		if call == nil {
-			continue
-		}
-		call.ID = id
-		call.Field = field
-		return call
+	//
+	// 参数容器是 oneof，正常只会有一个工具字段。挑出它之后无论解析成不成功
+	// 都要给出一次调用：早期解析器返回 nil 就整个丢弃，结果「完成帧到了但少个
+	// 字段」的调用凭空消失，收尾时又被当成「宣告了没做完」，既误报又往正文里
+	// 插一句莫名其妙的说明。
+	field, body := firstToolField(w)
+	if field == 0 {
+		return nil
 	}
 
-	// 走到这里说明上游用了我们还不解析参数的工具。必须报出来——直接丢弃会让
-	// 客户端收不到任何调用，对话就那样断掉，且无从排查。
-	for field := range w {
-		if toolMetaFields[field] {
-			continue
-		}
-		if _, parsed := toolParsers[field]; parsed {
-			continue
-		}
-		if body := proto.FirstBytes(w, field); body != nil {
-			return &NativeToolCall{
-				Kind: ToolUnknown, ID: id, Field: field,
-				Name:        toolNames[field],
-				Description: firstStringDeep(body, 3),
-				Raw:         body,
+	if parse, ok := toolParsers[field]; ok {
+		if a := args(field); a != nil {
+			if call := parse(a); call != nil {
+				call.ID = id
+				call.Field = field
+				return call
 			}
 		}
 	}
-	return nil
+
+	// 要么是还不解析参数的工具，要么是参数不完整。都要报出来——
+	// 直接丢弃会让客户端收不到任何调用，对话就那样断掉，且无从排查。
+	return &NativeToolCall{
+		Kind: ToolUnknown, ID: id, Field: field,
+		Name:        toolNames[field],
+		Description: firstStringDeep(body, 3),
+		Raw:         body,
+	}
+}
+
+// firstToolField 从参数容器里挑出工具字段（跳过与工具无关的附带字段）。
+// 容器是 oneof，正常只有一个；真出现多个时优先取我们能解析的那个，
+// 避免 map 遍历顺序带来的不确定性。
+func firstToolField(w map[int][]proto.Field) (int, []byte) {
+	best, bestBody := 0, []byte(nil)
+	for f := range w {
+		if toolMetaFields[f] {
+			continue
+		}
+		body := proto.FirstBytes(w, f)
+		if body == nil {
+			continue
+		}
+		if _, known := toolParsers[f]; known {
+			return f, body
+		}
+		if best == 0 || f < best {
+			best, bestBody = f, body
+		}
+	}
+	return best, bestBody
 }
 
 // toolParsers 按字段号解析各工具的参数。
@@ -742,7 +771,7 @@ type agentStreamState struct {
 	model string
 	// announced 记录「进行中」帧宣告过的调用；收到完成帧后由 emitted 抵消。
 	// 收尾时还剩下的，就是上游宣告了却没做完的工具。
-	announced map[string]NativeToolKind
+	announced map[string]string
 	// toolKind / toolPath 记录每次调用的工具类型与路径。
 	// 「进行中」帧先于参数片段到达，据此判断片段要不要转发。
 	toolKind map[string]NativeToolKind
@@ -801,13 +830,19 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 
 			// 「进行中」帧先到：记下这次调用的工具类型与路径，
 			// 后续的参数片段才知道该不该转发。
-			if id, kind, path, ok := parseToolProgress(smFields); ok {
+			if id, kind, path, field, ok := parseToolProgress(smFields); ok {
 				if s.toolKind == nil {
 					s.toolKind = map[string]NativeToolKind{}
 					s.toolPath = map[string]string{}
-					s.announced = map[string]NativeToolKind{}
+					s.announced = map[string]string{}
 				}
-				s.announced[id] = kind
+				// 记规范名而不是内部类型：没映射的工具也能在日志里报出名字，
+				// 而不是一律显示「未知」
+				name := toolNames[field]
+				if name == "" {
+					name = string(kind)
+				}
+				s.announced[id] = name
 				if kind != "" {
 					s.toolKind[id] = kind
 				}

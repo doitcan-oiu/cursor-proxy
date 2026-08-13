@@ -830,11 +830,10 @@ func TestMetaFieldsAreNotReportedAsTools(t *testing.T) {
 }
 
 // 上游有时只发「进行中」帧宣告要用某工具，然后既不给参数也不发完成帧
-// （实测 web_search 就是这样）。客户端只会收到模型那句「我这就去搜索…」
-// 然后流正常结束，看起来像说完了——必须补一句说明，不能静默。
+// （实测 web_search 就是这样）。这一轮又什么都没产出时，客户端会收到一个
+// 空回复然后流正常结束，看起来像说完了——必须补一句说明，不能静默。
 func TestAnnouncedButUnfinishedToolIsReported(t *testing.T) {
 	var data []byte
-	data = append(data, contentFrame("I'll search for that.")...)
 	data = append(data, progressFrame("toolu_ws", toolWebSearch, "")...)
 	data = append(data, conversationFrame(4)...)
 
@@ -857,6 +856,74 @@ func TestAnnouncedButUnfinishedToolIsReported(t *testing.T) {
 	}
 	if !strings.Contains(text, "没有给出参数") {
 		t.Fatalf("应说明原因，实际 %q", text)
+	}
+}
+
+// 但这一轮只要有产出，半途放弃的宣告就是无害的中间状态——模型想了想改主意而已。
+// 早期不加区分，实测十小时内往用户回复里插了 33 次说明，绝大多数所在的轮次好好的。
+func TestAbandonedAnnouncementIsSilentWhenTurnProduced(t *testing.T) {
+	var data []byte
+	data = append(data, contentFrame("这是正常的回答内容。")...)
+	data = append(data, progressFrame("toolu_ws", toolWebSearch, "")...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var text string
+	for ev := range events {
+		if ev.Kind == EventDelta {
+			text += ev.Text
+		}
+	}
+	if text != "这是正常的回答内容。" {
+		t.Fatalf("有正文时不该插入任何说明，实际 %q", text)
+	}
+}
+
+// 完成帧到了、但参数少了我们期待的字段（比如写文件没带路径）时，
+// 不能整个丢弃：那样这次调用凭空消失，收尾时又被当成「宣告了没做完」，
+// 既误报又往正文里插一句莫名其妙的说明。
+func TestIncompleteArgsStillReportsCall(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(6, "只有内容没有路径")
+
+	var data []byte
+	data = append(data, progressFrame("toolu_w", toolWriteFile, "")...)
+	data = append(data, toolCallFrame("toolu_w", toolWriteFile, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var calls []NativeToolCall
+	var text string
+	for ev := range events {
+		switch ev.Kind {
+		case EventToolCall:
+			calls = append(calls, *ev.Tool)
+		case EventDelta:
+			text += ev.Text
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("完成帧到了就该下发一次调用，实际 %d 次", len(calls))
+	}
+	if calls[0].Name != "edit" {
+		t.Fatalf("应带上上游的规范名便于排查，实际 %q", calls[0].Name)
+	}
+	if strings.Contains(text, "没有给出参数") {
+		t.Fatalf("调用已下发就不该再插说明：%q", text)
 	}
 }
 
@@ -1022,4 +1089,31 @@ func restoreEnv(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	config.Reset()
+}
+
+// 没映射参数的工具也要在日志与提示里报出上游的规范名，
+// 一律显示「未知」等于把 toolNames 那张表白建了。
+func TestUnfinishedAnnouncementUsesUpstreamName(t *testing.T) {
+	var data []byte
+	// 字段 28 = generate_image，我们不解析它的参数
+	data = append(data, progressFrame("toolu_img", 28, "")...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var text string
+	for ev := range events {
+		if ev.Kind == EventDelta {
+			text += ev.Text
+		}
+	}
+	if !strings.Contains(text, "generate_image") {
+		t.Fatalf("应报出规范名而不是「未知」，实际 %q", text)
+	}
 }
