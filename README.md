@@ -221,9 +221,15 @@ OpenCode 用 `@ai-sdk/anthropic` 走 `/v1/messages`。有个坑：**自定义模
 > I'm in Ask mode, so I can't generate creative writing, roleplay content,
 > or produce the interactive fiction output you're requesting.
 
-而且这句话一旦进了对话历史，后面每轮都会被回放给模型，它会照着自己上一轮的说法继续拒绝。
 确定只拿这个代理问代码的话，可以设 `ASK_MODE=on` 打开；声明了 `tools` 的请求
 任何时候都留在 agent 模式，否则内置工具桥接就没得桥了。
+
+**已经被拒绝过的会话救不回来**。模型拒绝之后，那句话就留在对话历史里，
+后面每轮都会被回放给它，它会跟自己上一轮保持一致继续拒绝——换掉模式也只是
+换个说法（agent 模式下变成「I'm a coding assistant designed to help with
+software engineering tasks」）。改配置、重启代理都不解决这个。办法是开一条新对话，
+或者在客户端里把那条拒绝从历史中删掉：实测历史正常的会话完全不受影响，
+不必丢掉整个会话。
 
 代理会把这种调用的内容还原成回复正文，所以纯聊天客户端能正常拿到内容，
 而且是**逐字流式**的：上游本来就在分片下发这些内容（`sm.15` 帧），
