@@ -9,6 +9,8 @@ import (
 	"image/png"
 	"testing"
 
+	"cursor-proxy/internal/config"
+	"cursor-proxy/internal/proto"
 	"cursor-proxy/internal/tools"
 	"cursor-proxy/internal/types"
 )
@@ -127,4 +129,37 @@ func base64PNG(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// ASK 模式默认必须关着。它是 Cursor 里「就代码库提问」的模式，上游会限定模型
+// 只回答代码相关问题，通用场景下会被模型拿去当拒绝理由，并且那句话进了
+// 对话历史后会被反复回放，之后每轮都照着拒绝。
+func TestDefaultModeIsAgent(t *testing.T) {
+	t.Setenv("ASK_MODE", "")
+	config.Reset()
+
+	if got := ModeFor(0); got != proto.ModeAgent {
+		t.Fatalf("纯对话默认应走 agent 模式，实际 %d", got)
+	}
+	if got := ModeFor(3); got != proto.ModeAgent {
+		t.Fatalf("声明了工具必须走 agent 模式，实际 %d", got)
+	}
+}
+
+// 显式打开时纯对话才走 ASK；声明了工具的请求任何时候都不能走，
+// 否则内置工具桥接就没得桥了。
+func TestAskModeOnlyWhenOptedInAndNoTools(t *testing.T) {
+	t.Setenv("ASK_MODE", "on")
+	config.Reset()
+	defer func() {
+		t.Setenv("ASK_MODE", "")
+		config.Reset()
+	}()
+
+	if got := ModeFor(0); got != proto.ModeAsk {
+		t.Fatalf("显式打开后纯对话应走 ASK，实际 %d", got)
+	}
+	if got := ModeFor(1); got != proto.ModeAgent {
+		t.Fatalf("声明了工具仍必须走 agent，实际 %d", got)
+	}
 }

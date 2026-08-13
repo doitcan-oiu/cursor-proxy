@@ -45,9 +45,11 @@ func backoff(attempt int) {
 
 // ModeFor 按客户端是否声明工具挑选上游模式。
 //
-// 上游默认按 agent 行事：即便对话里没有任何工具，问它「写一段 SVG」它也会把内容
-// 塞进一次「写文件」调用，得再还原成正文。纯对话场景改用 ASK 模式后，模型直接作答，
-// 少一层来回。声明了工具的客户端必须留在 agent 模式，否则内置工具桥接就没得桥了。
+// 默认一律 agent 模式。ASK 模式（ASK_MODE=on 才启用）虽然能让纯对话少走一层
+// 「写文件再还原」，但它是 Cursor 里「就代码库提问」的模式，上游会限定模型
+// 只回答代码相关问题，通用场景下反而会被模型当成拒绝理由。
+//
+// 声明了工具的客户端任何时候都必须留在 agent 模式，否则内置工具桥接就没得桥了。
 func ModeFor(toolCount int) proto.Mode {
 	if toolCount > 0 || !config.Get().AskMode {
 		return proto.ModeAgent

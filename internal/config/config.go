@@ -55,9 +55,15 @@ type Config struct {
 	IMAPPort          int
 
 	// AskMode 决定纯对话（客户端没声明工具）时是否让上游走 ASK 模式。
-	// 开启后模型直接作答，不再把内容塞进「写文件」调用再由本代理还原。
-	// 代价是提示词像「Create a file…」时，模型有时会先说一句自己处于 Ask 模式。
-	// 设 ASK_MODE=off 可退回原来的 agent 行为。
+	//
+	// 默认关闭。ASK 不是通用问答模式，而是 Cursor 里「就代码库提问」的模式：
+	// 上游会告诉模型「你只能回答代码和代码库相关的问题」。对通用代理来说这是负担——
+	// 实测模型会拿它当拒绝理由（「I'm in Ask mode, so I can't generate creative
+	// writing, roleplay content…」），而且这句话一旦进了对话历史就会被反复回放，
+	// 之后每轮都照着拒绝。
+	//
+	// 它唯一的好处是纯对话时不走「写文件再还原」那条路，但那条路现在已经能正常
+	// 流式输出了，收益有限。确定只用来问代码的话可以设 ASK_MODE=on 打开。
 	AskMode bool
 
 	// TokenizerMode 决定 usage 的 token 如何计算：
@@ -68,6 +74,8 @@ type Config struct {
 }
 
 var (
+	// mu 只保护 once/cached 的替换，正常路径上 Get 仍走 sync.Once 无锁快路径。
+	mu     sync.Mutex
 	once   sync.Once
 	cached *Config
 )
@@ -95,6 +103,14 @@ func projectRoot() string {
 	}
 	wd, _ := os.Getwd()
 	return wd
+}
+
+// Reset 丢弃缓存，下次 Get 会重新读环境变量。仅供测试使用。
+func Reset() {
+	mu.Lock()
+	defer mu.Unlock()
+	once = sync.Once{}
+	cached = nil
 }
 
 // Get 惰性构造并缓存全局配置。
@@ -129,7 +145,7 @@ func Get() *Config {
 			MailCodeTimeoutMs:   envInt("MAIL_CODE_TIMEOUT_MS", 120000),
 			IMAPHost:            envStr("IMAP_HOST", ""),
 			IMAPPort:            envInt("IMAP_PORT", 993),
-			AskMode:             envStr("ASK_MODE", "on") != "off",
+			AskMode:             envStr("ASK_MODE", "off") == "on",
 			TokenizerMode:       envStr("TOKENIZER", "bpe"),
 			Antiban: Antiban{
 				MinIntervalMs:          envInt("ACCOUNT_MIN_INTERVAL_MS", 0),

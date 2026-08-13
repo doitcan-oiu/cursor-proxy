@@ -262,9 +262,19 @@ agent.v1.UserMessage.4 = mode
 声明了用 AGENT（内置工具桥接照常）。实测同一个 SVG 提示词，ASK 模式下
 472 块纯文本流式，不再绕道写文件；「写个 Python 快排」直接给代码块。
 
-已知代价：提示词带「Create a file…」字样时模型有时会先说一句
-「I'm currently in Ask mode…」。试过用 `AgentRunRequest.8 = custom_system_prompt`
-压掉这句，上游返回 `invalid_argument`，这条路走不通。留了 `ASK_MODE=off` 作退路。
+**后来又改回默认关闭**（`ASK_MODE=on` 才启用）。ASK 不是通用问答模式，而是 Cursor 里
+「就代码库提问」的模式，上游会限定模型只回答代码相关问题。实测后果是模型拿它当拒绝理由：
+
+> I'm in Ask mode, so I can't generate creative writing, roleplay content,
+> or produce the interactive fiction output you're requesting.
+
+更麻烦的是这句话进了对话历史后会被反复回放，模型会照着自己上一轮的说法继续拒绝，
+于是整段对话就卡死在同一句回复上。而它换来的好处（省掉一层「写文件再还原」）
+在流式修好之后已经不明显——实测同一批提示词在 agent 模式下 SVG 首块 2.7s、
+1038 块流式，互动小说、通用问答都正常。
+
+也试过用 `AgentRunRequest.8 = custom_system_prompt` 压掉那句自述，
+上游返回 `invalid_argument`，这条路走不通。
 
 ### ~~P0：长回答写到一半被时长上限静默掐断~~（已在 Go 版修复）
 `AGENT_HARD_CAP_MS` 默认 180 秒，且是从建流那一刻算起的墙钟时间，不看流是否还在正常输出。

@@ -209,19 +209,21 @@ OpenCode 用 `@ai-sdk/anthropic` 走 `/v1/messages`。有个坑：**自定义模
 
 ### 纯对话（不声明 tools）时的行为
 
-上游支持 ask 模式，字段是 `UserMessage.mode`（`agent.v1.AgentMode`，`ASK = 2`）。
-本代理**按客户端是否声明工具自动切换**：
+上游是 agent 形态：问它「写一段 SVG」会把内容塞进一次「写文件」调用而不是直接回答，
+在聊天客户端里表现为只回一句「我这就写…」然后没有下文。代理会把这类调用还原成正文
+（见下），所以纯聊天客户端用起来没有区别。
 
-- 没声明 `tools` → ASK 模式。模型直接作答，不再把内容塞进「写文件」调用。
-- 声明了 `tools` → agent 模式。内置工具桥接照常工作，行为不变。
+上游确实还有一个 ask 模式（`UserMessage.mode`，`agent.v1.AgentMode` 的 `ASK = 2`），
+能让模型直接作答、省掉这层还原。**但默认不开**，因为它不是通用问答模式，而是 Cursor 里
+「就代码库提问」的模式：上游会告诉模型「你只能回答代码和代码库相关的问题」。实测的后果是
+模型会拿它当拒绝理由——
 
-已知代价：提示词里带「Create a file…」这类字样时，模型有时会先说一句
-「I'm currently in Ask mode…」再给内容。实测普通提问与「写个函数」类请求不会触发。
-设 `ASK_MODE=off` 可整体退回 agent 行为。
+> I'm in Ask mode, so I can't generate creative writing, roleplay content,
+> or produce the interactive fiction output you're requesting.
 
-下面这套还原逻辑在 agent 模式下仍然有效（`ASK_MODE=off` 或声明了工具时会用到）：
-上游是 agent 形态，问它「写一段 SVG」会把内容塞进一次「写文件」调用而不是直接回答，
-在聊天客户端里表现为只回一句「我这就写…」然后没有下文。
+而且这句话一旦进了对话历史，后面每轮都会被回放给模型，它会照着自己上一轮的说法继续拒绝。
+确定只拿这个代理问代码的话，可以设 `ASK_MODE=on` 打开；声明了 `tools` 的请求
+任何时候都留在 agent 模式，否则内置工具桥接就没得桥了。
 
 代理会把这种调用的内容还原成回复正文，所以纯聊天客户端能正常拿到内容，
 而且是**逐字流式**的：上游本来就在分片下发这些内容（`sm.15` 帧），
