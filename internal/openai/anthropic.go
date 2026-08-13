@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -235,8 +236,14 @@ func sse(event string, data any) string {
 
 // Messages 处理 POST /v1/messages（Anthropic 兼容）。
 func Messages(w http.ResponseWriter, r *http.Request) {
+	// 原始请求体留着：出错时记进日志，便于原样复现
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
+	if err != nil {
+		WriteJSON(w, 400, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": "Failed to read request body."}})
+		return
+	}
 	var body anthropicBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		WriteJSON(w, 400, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": "Invalid JSON body."}})
 		return
 	}
@@ -268,7 +275,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	opened, uerr := OpenWithFailover(messages, model, ModeFor(len(toolDefs)))
 	if uerr != nil {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, KeyPrefix: keyPrefix, Stream: body.Stream,
-			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(), Error: trunc(uerr.Msg, 200)})
+			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(),
+			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
 		status := 502
 		if uerr.Status >= 400 && uerr.Status < 600 {
 			status = uerr.Status
@@ -404,7 +412,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		cursor.ReleaseAccount(account.ID, outcome, "")
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(),
-			Chars: utf8.RuneCountInString(content.String()), Tokens: outputTokens, Error: trunc(errMsg, 200)})
+			Chars: utf8.RuneCountInString(content.String()), Tokens: outputTokens,
+			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
 		return
 	}
 
@@ -438,7 +447,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	if content == "" && len(toolCalls) == 0 && lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
-			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(), Error: trunc(lastError, 200)})
+			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(),
+			Error: trunc(lastError, 200), Request: reqlog.SanitizeRequest(raw)})
 		WriteJSON(w, 502, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": FriendlyUpstream(lastError)}})
 		return
 	}

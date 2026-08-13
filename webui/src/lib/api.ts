@@ -80,6 +80,8 @@ export interface LogEntry {
   chars?: number
   tokens?: number
   error?: string
+  /** 失败时留存的请求体（已去掉图片载荷并截断），成功的请求不留。 */
+  request?: string
 }
 
 export interface LogStats {

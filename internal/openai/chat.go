@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -204,8 +205,15 @@ func keyPrefixFromAuth(r *http.Request) string {
 
 // ChatCompletions 处理 POST /v1/chat/completions。
 func ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	// 原始请求体留着：出错时记进日志，便于原样复现。
+	// 只读一次，之后都用这份字节。
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
+	if err != nil {
+		SendError(w, 400, "Failed to read request body.", "invalid_request_error", "")
+		return
+	}
 	var body chatBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		SendError(w, 400, "Invalid JSON body.", "invalid_request_error", "")
 		return
 	}
@@ -231,7 +239,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	opened, uerr := OpenWithFailover(messages, body.Model, ModeFor(len(toolDefs)))
 	if uerr != nil {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Stream: body.Stream, KeyPrefix: keyPrefix,
-			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(), Error: trunc(uerr.Msg, 200)})
+			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(),
+			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
 		if uerr.Status == 0 || uerr.Status == 503 {
 			SendError(w, 503, "无可用 Cursor 账号: "+FriendlyUpstream(uerr.Msg), "server_error", "no_account_available")
 			return
@@ -374,7 +383,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		cursor.ReleaseAccount(account.ID, outcome, "")
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(),
-			Chars: utf8.RuneCountInString(content.String()), Tokens: completionTokens, Error: trunc(errMsg, 200)})
+			Chars: utf8.RuneCountInString(content.String()), Tokens: completionTokens,
+			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
 		writeSSE("data: [DONE]\n\n")
 		return
 	}
@@ -411,7 +421,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if content == "" && len(toolCalls) == 0 && lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
-			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(), Error: trunc(lastError, 200)})
+			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(),
+			Error: trunc(lastError, 200), Request: reqlog.SanitizeRequest(raw)})
 		SendError(w, 502, FriendlyUpstream(lastError), "upstream_error", "")
 		return
 	}
@@ -557,4 +568,16 @@ func trunc(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// maxRequestBody 是允许读入的请求体上限。带图请求可能很大，但也不能无上限。
+const maxRequestBody = 64 << 20
+
+// requestOnError 只在出错时返回留档用的请求体。
+// 成功的请求不留，避免把内存耗在正常流量上。
+func requestOnError(errored bool, raw []byte) string {
+	if !errored {
+		return ""
+	}
+	return reqlog.SanitizeRequest(raw)
 }

@@ -8,13 +8,72 @@ import EmptyState from '@/components/app/EmptyState.vue'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { api, type LogEntry, type LogStats } from '@/lib/api'
-import { formatDuration, formatNumber, formatTime } from '@/lib/format'
+import { copyText, formatDuration, formatNumber, formatTime } from '@/lib/format'
 
 const entries = ref<LogEntry[]>([])
 const stats = ref<LogStats | null>(null)
 const live = ref(true)
 const onlyErrors = ref(false)
+/** 展开了请求体的日志 id。失败时才会有请求体。 */
+const expanded = ref(new Set<number>())
 let timer: number | undefined
+
+function toggle(id: number) {
+  const next = new Set(expanded.value)
+  next.has(id) ? next.delete(id) : next.add(id)
+  expanded.value = next
+}
+
+/** 把一条失败记录整理成可直接发给别人排查的形态。 */
+function report(e: LogEntry) {
+  return JSON.stringify(
+    {
+      time: new Date(e.time).toISOString(),
+      model: e.model,
+      stream: e.stream,
+      httpStatus: e.httpStatus,
+      ms: e.ms,
+      error: e.error,
+      request: tryParse(e.request),
+    },
+    null,
+    2,
+  )
+}
+
+function tryParse(raw?: string) {
+  if (!raw) return raw
+  try {
+    return JSON.parse(raw)
+  } catch {
+    // 超长被截断过，解析不了就原样带上
+    return raw
+  }
+}
+
+/** 预览时缩进展开，一整行 JSON 要横向拖着看太费劲。 */
+function pretty(raw?: string) {
+  if (!raw) return ''
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+}
+
+async function copyRequest(e: LogEntry) {
+  await copyText(report(e))
+  toast.success('已复制，可直接粘贴给他人排查')
+}
+
+function exportRequest(e: LogEntry) {
+  const url = URL.createObjectURL(new Blob([report(e)], { type: 'application/json' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `failed-request-${e.id}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+}
 
 const visible = computed(() => {
   const list = onlyErrors.value ? entries.value.filter((e) => e.status !== 'ok') : entries.value
@@ -167,6 +226,37 @@ onUnmounted(() => window.clearInterval(timer))
                   <p class="rounded-md bg-danger-bg px-3 py-2 text-[12px] leading-relaxed text-danger">
                     {{ e.error }}
                   </p>
+
+                  <!-- 失败时留存了请求体，方便原样复现问题 -->
+                  <div v-if="e.request" class="mt-2">
+                    <div class="flex items-center gap-2">
+                      <button
+                        type="button"
+                        class="rounded-full border border-hairline bg-canvas px-3 py-1 text-[12px] font-medium text-steel transition-colors hover:bg-surface"
+                        @click="toggle(e.id)"
+                      >
+                        {{ expanded.has(e.id) ? '收起请求' : '查看请求' }}
+                      </button>
+                      <button
+                        type="button"
+                        class="rounded-full border border-hairline bg-canvas px-3 py-1 text-[12px] font-medium text-steel transition-colors hover:bg-surface"
+                        @click="copyRequest(e)"
+                      >
+                        复制
+                      </button>
+                      <button
+                        type="button"
+                        class="rounded-full border border-hairline bg-canvas px-3 py-1 text-[12px] font-medium text-steel transition-colors hover:bg-surface"
+                        @click="exportRequest(e)"
+                      >
+                        导出 JSON
+                      </button>
+                    </div>
+                    <pre
+                      v-if="expanded.has(e.id)"
+                      class="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-all rounded-md bg-surface p-3 font-mono text-[12px] leading-relaxed text-charcoal"
+                    >{{ pretty(e.request) }}</pre>
+                  </div>
                 </td>
               </tr>
             </template>

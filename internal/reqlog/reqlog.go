@@ -22,6 +22,9 @@ type Entry struct {
 	// Tokens 是输出 token 的估算值（见 internal/tokenize）。
 	Tokens int    `json:"tokens,omitempty"`
 	Error  string `json:"error,omitempty"`
+	// Request 是出错时留存的请求体（已去掉图片载荷并截断）。
+	// 只有失败的请求才留，用于复现问题；成功的请求不留，避免白占内存。
+	Request string `json:"request,omitempty"`
 }
 
 // Stats 汇总统计。
@@ -53,6 +56,9 @@ func Record(e Entry) Entry {
 	buffer = append(buffer, e)
 	if len(buffer) > maxEntries {
 		buffer = buffer[len(buffer)-maxEntries:]
+	}
+	if e.Request != "" {
+		trimBodies()
 	}
 	return e
 }
