@@ -443,6 +443,41 @@ schema 缺失时退回到通用三字段。改完后 OpenCode 里待办正常渲
 顺带把宣告帧的名称来源换成 `toolNames`：没映射参数的工具不再一律显示「未知」，
 而是报出 `generate_image` 这样的规范名。
 
+### ~~P1：Anthropic 端点丢弃全部推理内容~~（已在 Go 版修复）
+`/v1/messages` 的流式分支只处理 `ev.Text`，完全不管 `ev.Thinking`。
+实测一道推理题上游给了 3201 字推理，接 OpenCode 的客户端一个字都收不到——
+这部分 token 照样计费，内容却被扔了。OpenAI 端点一直有转发（`reasoning_content`），
+只有这边漏了。
+
+补上 `thinking` 内容块，排在正文之前。块下标由新的 `blockWriter` 统一发号：
+有推理时正文是 1 号、工具调用从 2 号起；没有推理时正文仍是 0 号，
+不能空出下标让客户端解析错位。
+
+### 关于「为什么在 Cursor 里不觉得慢」的排查（结论：代理不是瓶颈）
+用 `PROXY_TIMING=1` 量了一次完整 agent 会话（OpenCode 跑代码排查，
+11 个请求、32 次工具调用、14.9 分钟）：
+
+| 阶段 | 占比 |
+| --- | --- |
+| 上游思考（首个产出之前） | **93.8%** |
+| 上游握手 | 0.5% |
+| 代理自身 | 0.03% |
+
+思考时间随上下文快速增长（583 tok → 1.3s；47499 tok → 296.8s），
+而每轮输出只有几十个 token。试过的优化路径与结果：
+
+- **拍平历史是否臃肿**：不臃肿。36242 tok 的原始内容拍平后 36414 tok，只多 0.5%。
+- **`conversation_state.root_prompt_messages_json`**（Cursor 客户端真正用的字段）：
+  按猜测的格式填进去，上游收下请求但一个字都不生成。它还依赖 `turns`、
+  `token_details`、`file_states` 等一整套状态，不是填几条消息就能用的。
+- **固定 `conversation_id`**：上游不按它保留会话状态（第二轮就不记得第一轮的名字）。
+- **上游是否有提示词缓存**：测出来波动极大——同一个请求重发，首字 3.3s 和 16.5s
+  都出现过。样本内无法得出可靠结论，因此没有据此重写协议层。
+
+结论是代理侧已无可压榨的空间，决定速度的是模型推理档位与上下文长度。
+同等 2 万 token 上下文下：`claude-opus-5-thinking-max` 首字 14.5s，
+`claude-opus-5-thinking-medium` 4.0s，`claude-4.6-opus-max` 4.9s。
+
 ### P2：`checkAllAccounts` / 批量验号会打真实计费请求
 `get-current-period-usage` 和 `full_stripe_profile` 每次验号都会请求 Cursor 官方接口。账号多时
 一轮全量验号是几十上百个外部请求，且无缓存。建议对 plan/usage 结果做短 TTL 缓存（如 5 分钟），

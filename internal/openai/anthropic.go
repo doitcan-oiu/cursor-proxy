@@ -322,8 +322,12 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
 			},
 		})
-		send("content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
 		send("ping", map[string]any{"type": "ping"})
+
+		// 思考内容单独占一个 thinking 块，排在正文之前。
+		// 早期这里直接丢掉推理，接 OpenCode 时用户完全看不到——实测一次问答
+		// 上游给了 3000 多字推理，全被扔了，等于白付了这部分 token。
+		blk := &blockWriter{send: send}
 
 		var scanner *tools.Scanner
 		if len(toolDefs) > 0 {
@@ -334,7 +338,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			content.WriteString(text)
-			send("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": text}})
+			blk.text(text)
 		}
 
 		var calls []tools.Call
@@ -350,6 +354,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 					gotFirst = true
 					tl.mark("等首个增量")
 				}
+				blk.thinking(ev.Thinking)
 				if ev.Text != "" {
 					emitText(live.Interrupt())
 					if scanner != nil {
@@ -389,11 +394,11 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			emitText(scanner.Flush())
 			calls = append(calls, scanner.Calls()...)
 		}
-		send("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+		textIndex := blk.closeAll()
 
 		// 工具调用各占一个 tool_use 内容块，紧跟在文本块之后。
 		for i, c := range calls {
-			idx := i + 1
+			idx := textIndex + 1 + i
 			send("content_block_start", map[string]any{
 				"type": "content_block_start", "index": idx,
 				"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": map[string]any{}},
@@ -511,4 +516,59 @@ func anthropicKeyPrefix(r *http.Request) string {
 		return k[:10]
 	}
 	return k
+}
+
+// blockWriter 管理 Anthropic 流式响应里的内容块下标。
+//
+// 推理和正文各占一个块，且推理必须排在正文前面；工具调用块再接在正文之后。
+// 下标要连续，空出一个号客户端就会解析错位，所以统一由它发号。
+type blockWriter struct {
+	send      func(string, any)
+	next      int
+	thinkOpen bool
+	textIndex int
+}
+
+// thinking 追加一段推理。正文已经开始后就不再补，避免块顺序错乱。
+func (b *blockWriter) thinking(text string) {
+	if text == "" || b.textIndex > 0 || b.next > 0 && !b.thinkOpen {
+		return
+	}
+	if !b.thinkOpen {
+		b.thinkOpen = true
+		b.send("content_block_start", map[string]any{"type": "content_block_start",
+			"index": b.next, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+		b.next++
+	}
+	b.send("content_block_delta", map[string]any{"type": "content_block_delta",
+		"index": b.next - 1, "delta": map[string]any{"type": "thinking_delta", "thinking": text}})
+}
+
+// text 追加一段正文，必要时先收尾推理块并开出正文块。
+func (b *blockWriter) text(s string) {
+	b.openText()
+	b.send("content_block_delta", map[string]any{"type": "content_block_delta",
+		"index": b.textIndex, "delta": map[string]any{"type": "text_delta", "text": s}})
+}
+
+func (b *blockWriter) openText() {
+	if b.next > 0 && !b.thinkOpen {
+		return // 正文块已经开过
+	}
+	if b.thinkOpen {
+		b.send("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.next - 1})
+		b.thinkOpen = false
+	}
+	b.textIndex = b.next
+	b.next++
+	b.send("content_block_start", map[string]any{"type": "content_block_start",
+		"index": b.textIndex, "content_block": map[string]any{"type": "text", "text": ""}})
+}
+
+// closeAll 收尾并返回正文块的下标，供工具调用块接着编号。
+// 一个字都没产出时也要开一个空文本块：规范要求至少有一个内容块。
+func (b *blockWriter) closeAll() int {
+	b.openText()
+	b.send("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.textIndex})
+	return b.textIndex
 }

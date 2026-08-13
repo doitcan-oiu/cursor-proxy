@@ -274,6 +274,13 @@ software engineering tasks」）。改配置、重启代理都不解决这个。
 `composer-2.5`、`glm-5.2-high` 都能正确读图；`kimi-k3-high` 会直接回「无法查看图片」。
 不支持视觉的模型只是答不出来，不会报错。
 
+### 推理内容
+
+`/v1/chat/completions` 以 `reasoning_content` 增量给出，
+`/v1/messages` 以标准的 `thinking` 内容块给出（排在正文之前）。
+思考型模型的推理往往比正文还长——实测一道推理题推理 3201 字、正文 562 字，
+这部分 token 照样计费，不该丢掉。
+
 ### 慢在哪：用 `PROXY_TIMING=1` 看分解
 
 `PROXY_TIMING=1` 启动后，每个请求会打印一行阶段耗时：
