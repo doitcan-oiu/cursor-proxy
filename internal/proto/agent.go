@@ -15,32 +15,108 @@ import (
 // /context.txt，结果 Cursor 的 agent 会认为自己身处代码工作区，先回一句
 // 「先读取工作区规则…」然后发起工具调用就结束本轮——对纯对话代理来说这等于
 // 每次都被截断。把对话直接写进消息正文后，模型会直接作答。
+//
+// 上游协议里其实有结构化的 UserMessageAction.conversation_history 字段
+// （含 tool_call / tool_result 子消息），但实测该端点完全忽略它：只发结构化历史时
+// 模型连上一轮说过的名字都不记得。所以历史只能继续拍平成文本。
+//
+// 拍平时刻意用中性叙述，不套 <tool_call> 之类的伪协议标签：模型会把那种写法
+// 连同注入的提示词一起判定为「伪造的代理对话记录」，明确拒绝采信，
+// 转而反复重试同一个工具。
 func BuildPrompt(messages []types.Message) string {
 	// 单条 user 消息原样送出，不加任何包装
-	if len(messages) == 1 && messages[0].Role == "user" {
+	if len(messages) == 1 && messages[0].Role == "user" && len(messages[0].ToolCalls) == 0 {
 		return types.ContentToText(messages[0].Content)
 	}
 
 	var b strings.Builder
-	for _, m := range messages {
-		content := strings.TrimSpace(types.ContentToText(m.Content))
-		if content == "" {
-			continue
+	write := func(s string) {
+		if s == "" {
+			return
 		}
 		if b.Len() > 0 {
 			b.WriteString("\n\n")
 		}
+		b.WriteString(s)
+	}
+
+	endsWithResult := false
+	for _, m := range messages {
+		content := strings.TrimSpace(types.ContentToText(m.Content))
+		endsWithResult = m.Role == "tool"
 		switch m.Role {
 		case "system", "developer":
 			// 系统提示直接作为正文开头，不加角色前缀
-			b.WriteString(content)
+			write(content)
+		case "assistant":
+			write(joinNonEmpty(content, describeCalls(m.ToolCalls)))
+		case "tool":
+			write(describeResult(m, content))
 		default:
-			b.WriteString(m.Role)
-			b.WriteString(": ")
-			b.WriteString(content)
+			if content != "" {
+				write(m.Role + ": " + content)
+			}
+		}
+	}
+
+	// 对话以工具结果结尾时，末尾没有任何指令，模型会倾向于「重新开始」
+	// 而不是「接着往下做」——表现为把刚执行过的工具再调一遍。
+	if endsWithResult {
+		write("The tool results above are already available to you. " +
+			"Continue the task using them; do not call the same tools again.")
+	}
+	return b.String()
+}
+
+// describeCalls 交代助手上一轮调用了什么工具。
+//
+// 刻意用平铺叙述而不是 <tool_call> 之类的伪协议标签：那种写法会被模型判定为
+// 「伪造的代理对话记录」，明确拒绝采信后反复重试同一个工具。
+// 也刻意用英文，避免给回答的语言带偏。
+func describeCalls(calls []types.ToolCall) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range calls {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("assistant: called tool ")
+		b.WriteString(c.Name)
+		if args := strings.TrimSpace(c.Args); args != "" && args != "{}" {
+			b.WriteString(" with ")
+			b.WriteString(args)
 		}
 	}
 	return b.String()
+}
+
+// describeResult 交代工具返回了什么。失败要单独标注，
+// 否则模型看不出上一次已经失败了，会原样再试一遍。
+func describeResult(m types.Message, content string) string {
+	name := m.ToolName
+	if name == "" {
+		name = "tool"
+	}
+	verb := "returned"
+	if m.IsError {
+		verb = "failed"
+	}
+	if content == "" {
+		return name + " " + verb + " (no output)"
+	}
+	return name + " " + verb + ":\n" + content
+}
+
+func joinNonEmpty(parts ...string) string {
+	var kept []string
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 // encodeSelectedImages 构造 UserMessage.selected_context，把图片挂进去。

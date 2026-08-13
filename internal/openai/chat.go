@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -86,30 +85,25 @@ func parseMessages(raw []rawMessage) []types.Message {
 			log.Printf("[image] 忽略一张无法解析的图片: %s", e)
 		}
 
+		// 工具调用与工具结果保持结构化，由 proto 层写进上游真正的
+		// conversation_history。早期在这里渲染成 <tool_call> 标签和
+		// 「[工具名] 结果」文本拼进正文，模型会识破那是伪造的对话记录并
+		// 拒绝采信，转而重复调用同样的工具——表现为反复读同一批文件。
 		switch {
 		case len(m.ToolCalls) > 0:
-			var b strings.Builder
-			b.WriteString(text)
+			calls := make([]types.ToolCall, 0, len(m.ToolCalls))
 			for _, tc := range m.ToolCalls {
-				if b.Len() > 0 {
-					b.WriteString("\n")
-				}
-				b.WriteString(tools.RenderCall(tools.Call{
-					ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
-				}))
+				calls = append(calls, types.ToolCall{
+					ID: tc.ID, Name: tc.Function.Name, Args: tc.Function.Arguments,
+				})
 			}
-			out = append(out, types.Message{Role: "assistant", Content: b.String()})
+			out = append(out, types.Message{Role: "assistant", Content: text, ToolCalls: calls})
 
 		case m.Role == "tool":
-			label := m.Name
-			if label == "" {
-				label = m.ToolCallID
-			}
-			body := text
-			if label != "" {
-				body = fmt.Sprintf("[%s] %s", label, text)
-			}
-			out = append(out, types.Message{Role: "tool", Content: body})
+			out = append(out, types.Message{
+				Role: "tool", Content: text, Images: images,
+				ToolCallID: m.ToolCallID, ToolName: m.Name,
+			})
 
 		default:
 			out = append(out, types.Message{Role: m.Role, Content: content, Images: images})
@@ -492,16 +486,9 @@ func toNative(c *cursor.NativeToolCall) tools.Native {
 	}
 }
 
-// nativeBridgeEnabled 控制是否把上游内置工具调用翻译给客户端。
-//
-// 默认开启。部分模型（实测 claude-4.6-opus-max）在需要写文件时，上游只下发
-// 「读文件」而从不下发写入，会导致客户端反复读同一个不存在的文件。
-// 这种情况可以用 NATIVE_TOOL_BRIDGE=off 关掉，退回纯提示词模拟。
-var nativeBridgeEnabled = !strings.EqualFold(os.Getenv("NATIVE_TOOL_BRIDGE"), "off")
-
 // mapNativeCall 把上游内置调用映射成客户端声明的工具调用。
 func mapNativeCall(c *cursor.NativeToolCall, defs []tools.Definition) (tools.Call, bool) {
-	if c == nil || len(defs) == 0 || !nativeBridgeEnabled {
+	if c == nil || len(defs) == 0 || !tools.NativeBridgeEnabled() {
 		return tools.Call{}, false
 	}
 	return tools.MapNative(toNative(c), defs)
@@ -520,8 +507,12 @@ func toolCallDelta(index int, c tools.Call) map[string]any {
 
 // injectToolPrompt 把工具说明并入 system 提示，并在最后一条用户消息末尾附一句提醒。
 // 没有工具时原样返回，保证普通对话的行为完全不变。
+//
+// 只为「上游没有内置对应物」的自定义工具注入。读文件、跑命令这类工具上游本来就有，
+// 走原生桥接更可靠；再额外注入一套 <tool_call> 文本协议只会适得其反——模型会把
+// 这段额外的系统提示连同历史一起当成伪造上下文，明确拒绝采用，然后反复重试同一个工具。
 func injectToolPrompt(messages []types.Message, defs []tools.Definition, choice tools.Choice) []types.Message {
-	prompt := tools.BuildSystemPrompt(defs, choice)
+	prompt := tools.BuildSystemPrompt(tools.WithoutNativeEquivalent(defs), choice)
 	if prompt == "" {
 		return messages
 	}

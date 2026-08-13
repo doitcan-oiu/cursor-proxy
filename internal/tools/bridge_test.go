@@ -271,3 +271,52 @@ func TestMapNativeWebSearch(t *testing.T) {
 		t.Fatalf("搜索词应带进参数：%s", call.Arguments)
 	}
 }
+
+// 读文件、跑命令这类工具上游本来就有，交给原生桥接即可。
+// 再为它们注入一套 <tool_call> 文本协议只会适得其反——模型会把这段额外的
+// 系统提示连同历史判定为伪造上下文，拒绝采用后反复重试同一个工具。
+func TestWithoutNativeEquivalentKeepsOnlyCustomTools(t *testing.T) {
+	defs := []Definition{
+		{Name: "Read"}, {Name: "bash"}, {Name: "Glob"}, {Name: "TodoWrite"},
+		{Name: "record_invoice"}, {Name: "send_slack_message"},
+	}
+	kept := WithoutNativeEquivalent(defs)
+	var names []string
+	for _, d := range kept {
+		names = append(names, d.Name)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("只应保留没有原生对应物的工具，实际保留 %v", names)
+	}
+	if names[0] != "record_invoice" || names[1] != "send_slack_message" {
+		t.Fatalf("保留的工具不对：%v", names)
+	}
+}
+
+// 全是内置工具时不注入任何提示词，普通 agent 客户端完全走原生桥接。
+func TestWithoutNativeEquivalentCanBeEmpty(t *testing.T) {
+	kept := WithoutNativeEquivalent([]Definition{{Name: "read"}, {Name: "write"}, {Name: "grep"}})
+	if len(kept) != 0 {
+		t.Fatalf("内置工具不应保留，实际 %d 个", len(kept))
+	}
+	if BuildSystemPrompt(kept, Choice{Mode: "auto"}) != "" {
+		t.Fatal("没有自定义工具时不应生成提示词")
+	}
+}
+
+// 提示词不能否认模型拥有内置工具：那是原生桥接存在之前的说法，
+// 现在明显不成立，模型能看出来并因此不信任整段注入。
+func TestSystemPromptDoesNotDenyBuiltinTools(t *testing.T) {
+	p := BuildSystemPrompt([]Definition{{Name: "record_invoice"}}, Choice{Mode: "auto"})
+	for _, banned := range []string{"NO built-in tools", "no built-in tools"} {
+		if strings.Contains(p, banned) {
+			t.Fatalf("不应否认内置工具的存在：\n%s", p)
+		}
+	}
+	if !strings.Contains(p, "record_invoice") {
+		t.Fatalf("应列出自定义工具：\n%s", p)
+	}
+	if strings.Contains(Reminder(), "no built-in tools") {
+		t.Fatalf("提醒语同样不应否认内置工具：%s", Reminder())
+	}
+}

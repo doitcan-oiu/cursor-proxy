@@ -101,8 +101,11 @@ func (b anthropicBody) toolChoice() tools.Choice {
 	return tools.Choice{Mode: "auto"}
 }
 
-// blocksToText 把内容块拍平成文本；tool_use / tool_result 会被还原成
-// 与提示词协议一致的形式，让模型看得懂上一轮发生了什么。
+// blocksToText 把内容块里的纯文本拍平。
+//
+// tool_use / tool_result 不在这里渲染：它们要保持结构化，由 proto 层写进上游
+// 真正的 conversation_history。早期把它们拼成 <tool_call> / <tool_result> 标签
+// 混进正文，模型会识破那是伪造的对话记录并拒绝采信，转而重复调用同样的工具。
 func blocksToText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -117,32 +120,62 @@ func blocksToText(raw json.RawMessage) string {
 	}
 	var sb strings.Builder
 	for _, b := range blocks {
-		switch b.Type {
-		case "tool_use":
-			args := "{}"
-			if len(b.Input) > 0 {
-				args = string(b.Input)
-			}
-			if sb.Len() > 0 {
-				sb.WriteString("\n")
-			}
-			sb.WriteString(tools.RenderCall(tools.Call{ID: b.ID, Name: b.Name, Arguments: args}))
-		case "tool_result":
-			if sb.Len() > 0 {
-				sb.WriteString("\n")
-			}
-			// 结果用显式标签包起来，模型更容易把它和自己的调用对应上；
-			// 失败结果单独标注，避免模型看不出「上一次已经失败了」而原样重试。
-			status := "tool_result"
-			if b.IsError {
-				status = "tool_error"
-			}
-			sb.WriteString(fmt.Sprintf("<%s id=%q>\n%s\n</%s>", status, b.ToolUseID, blocksToText(b.Content), status))
-		default:
+		if b.Type == "text" || b.Type == "" {
 			sb.WriteString(b.Text)
 		}
 	}
 	return sb.String()
+}
+
+// splitAnthropicMessage 把一条 Anthropic 消息按内容块拆成内部消息序列。
+//
+// Anthropic 把「助手发起的调用」和「工具返回的结果」放在同一条消息的不同块里，
+// 而上游的 conversation_history 要求它们各占一个轮次，所以这里要拆开。
+func splitAnthropicMessage(m anthropicMessage) []types.Message {
+	var blocks []anthropicBlock
+	if len(m.Content) > 0 && json.Unmarshal(m.Content, &blocks) != nil {
+		// 纯字符串内容
+		return []types.Message{{Role: m.Role, Content: blocksToText(m.Content)}}
+	}
+
+	var out []types.Message
+	var calls []types.ToolCall
+	for _, b := range blocks {
+		if b.Type != "tool_use" {
+			continue
+		}
+		args := "{}"
+		if len(b.Input) > 0 {
+			args = string(b.Input)
+		}
+		calls = append(calls, types.ToolCall{ID: b.ID, Name: b.Name, Args: args})
+	}
+
+	text := blocksToText(m.Content)
+	images := blocksToImages(m.Content)
+	if text != "" || len(calls) > 0 || (len(images) > 0 && m.Role != "user") {
+		msg := types.Message{Role: m.Role, Content: text, ToolCalls: calls}
+		if m.Role == "user" {
+			msg.Images = images
+		}
+		out = append(out, msg)
+	} else if len(images) > 0 {
+		out = append(out, types.Message{Role: m.Role, Content: text, Images: images})
+	}
+
+	// 工具结果各自成一轮
+	for _, b := range blocks {
+		if b.Type != "tool_result" {
+			continue
+		}
+		out = append(out, types.Message{
+			Role: "tool", Content: blocksToText(b.Content),
+			Images: blocksToImages(b.Content),
+			// Anthropic 的结果块只带调用 id，工具名由上游按 id 对应
+			ToolCallID: b.ToolUseID, IsError: b.IsError,
+		})
+	}
+	return out
 }
 
 // blocksToImages 取出内容块里的 image。tool_result 里也可能嵌图片，一并递归取出。
@@ -190,11 +223,7 @@ func anthropicToInternal(body anthropicBody) []types.Message {
 		msgs = append(msgs, types.Message{Role: "system", Content: sys})
 	}
 	for _, m := range body.Messages {
-		msgs = append(msgs, types.Message{
-			Role:    m.Role,
-			Content: blocksToText(m.Content),
-			Images:  blocksToImages(m.Content),
-		})
+		msgs = append(msgs, splitAnthropicMessage(m)...)
 	}
 	return msgs
 }

@@ -11,6 +11,25 @@ type Message struct {
 	// Images 是这条消息携带的图片。文本走 Content，图片单独走这里——
 	// 上游协议里两者也是分开的字段，拍平成文本会丢掉图片。
 	Images []Image
+	// ToolCalls 是 assistant 这一轮发起的工具调用。
+	//
+	// 早期把它渲染成 <tool_call> 标签拼进正文，连同工具结果一起变成一段
+	// 「对话记录」文本。模型会识破这是伪造的上下文并拒绝采信，转而重新调用
+	// 同样的工具——表现为无限重复读同一批文件。所以必须保持结构化，
+	// 由 proto 层写进上游真正的 conversation_history 字段。
+	ToolCalls []ToolCall
+	// 以下三个字段仅在 Role == "tool" 时有效。
+	ToolCallID string
+	ToolName   string
+	IsError    bool
+}
+
+// ToolCall 是一次工具调用的结构化形态。
+type ToolCall struct {
+	ID   string
+	Name string
+	// Args 是 JSON 编码的参数。
+	Args string
 }
 
 // Image 是一张待发给上游的图片。

@@ -178,3 +178,70 @@ func TestEncodeAgentRequestMode(t *testing.T) {
 		t.Fatal("未指定模式时不应写入字段 4")
 	}
 }
+
+// 历史里的工具调用与结果要用平铺叙述，不能套 <tool_call> 之类的伪协议标签。
+// 模型会把那种写法判定为「伪造的代理对话记录」并拒绝采信，
+// 转而反复重试同一个工具——现场表现就是无限重复读同一批文件。
+func TestBuildPromptRendersToolTurnsPlainly(t *testing.T) {
+	got := BuildPrompt([]types.Message{
+		{Role: "system", Content: "你是代码评审助手。"},
+		{Role: "user", Content: "评审这两个文件"},
+		{Role: "assistant", Content: "我先读一下。", ToolCalls: []types.ToolCall{
+			{ID: "c1", Name: "Read", Args: `{"filePath":"/a.py"}`},
+		}},
+		{Role: "tool", ToolCallID: "c1", ToolName: "Read", Content: "print(1)"},
+	})
+
+	for _, banned := range []string{"<tool_call>", "</tool_call>", "<tool_result", "<tool_error"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("不应出现伪协议标签 %q：\n%s", banned, got)
+		}
+	}
+	for _, want := range []string{"你是代码评审助手。", "评审这两个文件", "我先读一下。",
+		"called tool Read", `{"filePath":"/a.py"}`, "Read returned", "print(1)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("提示词里应包含 %q：\n%s", want, got)
+		}
+	}
+}
+
+// 对话以工具结果结尾时末尾没有任何指令，模型会倾向「重新开始」而不是「接着做」，
+// 表现为把刚执行过的工具再调一遍。必须补一句继续指令。
+func TestBuildPromptAsksToContinueAfterToolResult(t *testing.T) {
+	got := BuildPrompt([]types.Message{
+		{Role: "user", Content: "读一下"},
+		{Role: "assistant", ToolCalls: []types.ToolCall{{ID: "c1", Name: "Read", Args: "{}"}}},
+		{Role: "tool", ToolCallID: "c1", ToolName: "Read", Content: "内容"},
+	})
+	if !strings.Contains(got, "do not call the same tools again") {
+		t.Fatalf("末尾应提示不要重复调用：\n%s", got)
+	}
+
+	// 以用户提问结尾时不该加这句，否则会干扰正常提问
+	normal := BuildPrompt([]types.Message{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "你好"},
+		{Role: "user", Content: "再见"},
+	})
+	if strings.Contains(normal, "do not call the same tools again") {
+		t.Fatalf("普通对话不该出现继续指令：\n%s", normal)
+	}
+}
+
+// 工具失败要标注出来，否则模型看不出上一次已经失败，会原样再试一遍。
+func TestBuildPromptMarksFailedTool(t *testing.T) {
+	got := BuildPrompt([]types.Message{
+		{Role: "user", Content: "读一下"},
+		{Role: "tool", ToolName: "Read", Content: "no such file", IsError: true},
+	})
+	if !strings.Contains(got, "Read failed") {
+		t.Fatalf("失败应单独标注：\n%s", got)
+	}
+}
+
+// 单条用户消息仍要原样送出，不加任何包装。
+func TestBuildPromptSingleUserMessageUnchanged(t *testing.T) {
+	if got := BuildPrompt([]types.Message{{Role: "user", Content: "你好"}}); got != "你好" {
+		t.Fatalf("单条消息应原样送出，实际 %q", got)
+	}
+}

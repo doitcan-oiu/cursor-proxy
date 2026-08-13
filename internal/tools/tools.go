@@ -56,8 +56,14 @@ func BuildSystemPrompt(defs []Definition, choice Choice) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("# Tool calling\n\n")
-	b.WriteString("You can call tools. To call one, emit a block in EXACTLY this format:\n\n")
+	// 措辞必须站得住脚。早期这里写的是「你没有任何内置工具」，那是原生桥接
+	// 还不存在时用来逼模型走文本协议的说法。现在它明显不成立——模型能看出
+	// 自己确实有内置工具，于是把这整段连同历史一起判定为「伪造的代理对话记录」，
+	// 明确拒绝采用，然后反复重试同一个内置工具。所以这里只声明「额外工具」，
+	// 不否认它已有的能力。
+	b.WriteString("# Extra tools from the user's client\n\n")
+	b.WriteString("Besides your own built-in tools, the user's client exposes the extra tools listed below.\n")
+	b.WriteString("Your built-in tools cannot reach them. To call one, emit a block in EXACTLY this format:\n\n")
 	b.WriteString(OpenTag + "\n")
 	b.WriteString(`{"name": "tool_name", "arguments": {"arg": "value"}}` + "\n")
 	b.WriteString(CloseTag + "\n\n")
@@ -66,22 +72,14 @@ func BuildSystemPrompt(defs []Definition, choice Choice) string {
 	b.WriteString("- \"arguments\" MUST be a JSON object matching the tool's schema (use {} if the tool takes none).\n")
 	b.WriteString("- Emit one block per call; emit several blocks to call several tools.\n")
 	b.WriteString("- Do NOT wrap the block in markdown code fences.\n")
-	b.WriteString("- Results come back as messages from the \"tool\" role; then continue the task.\n")
-	// 下面三条是关键：上游本身是个带原生工具的 agent，涉及文件/终端时它会倾向
-	// 走自己的原生工具路径并直接结束轮次，导致只留下一句「我这就去做…」。
-	// 必须明确否定它拥有内置能力，并禁止「宣告动作却不给出调用块」。
-	b.WriteString("- You have NO built-in tools and NO direct access to files, the terminal, or the network.\n")
-	b.WriteString("  Emitting a " + OpenTag + " block is the ONLY way you can take any action.\n")
-	b.WriteString("- NEVER announce an action and then stop. If you say you will do something,\n")
+	b.WriteString("- Results come back in the next turn; then continue the task.\n")
+	b.WriteString("- Use this format ONLY for the tools listed below. Keep using your built-in tools normally\n")
+	b.WriteString("  for anything else.\n")
+	// 上游是个 agent，宣告动作后直接结束轮次是它的常见行为，
+	// 对代理来说等于这一轮什么也没发生。
+	b.WriteString("- NEVER announce that you will use one of these tools and then stop. If you say you will,\n")
 	b.WriteString("  the SAME reply MUST contain the corresponding " + OpenTag + " block.\n")
-	b.WriteString("- If a task needs several steps, call the first tool now; you will be invoked again\n")
-	b.WriteString("  with the result and can continue from there.\n")
-	// 上游的系统提示要求「编辑前必须先读文件」。创建新文件时这条规则会让模型
-	// 反复去读一个不存在的文件，陷入死循环——必须显式豁免。
-	b.WriteString("- If a read fails because the file does not exist, do NOT read it again.\n")
-	b.WriteString("  The file simply needs to be created: call the write/create tool directly.\n")
-	b.WriteString("- Never repeat a tool call that already failed with the same arguments.\n")
-	b.WriteString("  Change your approach instead.\n")
+	b.WriteString("- Never repeat a call that already failed with the same arguments; change your approach.\n")
 
 	switch choice.Mode {
 	case "required":
@@ -90,7 +88,7 @@ func BuildSystemPrompt(defs []Definition, choice Choice) string {
 		fmt.Fprintf(&b, "- You MUST call the tool %q in this turn.\n", choice.Name)
 	}
 
-	b.WriteString("\n## Available tools\n")
+	b.WriteString("\n## Extra tools\n")
 	for _, d := range defs {
 		fmt.Fprintf(&b, "\n### %s\n", d.Name)
 		if d.Description != "" {
@@ -120,8 +118,8 @@ func compactJSON(raw json.RawMessage) string {
 // 我们的规则离生成点较远，容易被它的原生行为盖过。末尾提醒利用近因效应，
 // 实测能显著降低「只宣告不调用」的概率。
 func Reminder() string {
-	return "\n\n[System reminder: you have no built-in tools. To act, emit a " +
-		OpenTag + " block in this reply; describing an action without the block does nothing.]"
+	return "\n\n[Reminder: to use one of the extra client tools, emit its " + OpenTag +
+		" block in this reply; naming the tool without the block does nothing.]"
 }
 
 // RenderCall 把一次工具调用还原成提示词里的标签形式，

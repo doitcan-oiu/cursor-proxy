@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -413,4 +414,40 @@ func renderTodos(items []TodoItem) string {
 		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// NativeBridgeEnabled 控制是否把上游内置工具调用翻译给客户端。
+//
+// 默认开启。关掉后退回纯提示词模拟，用于上游行为异常时兜底。
+func NativeBridgeEnabled() bool {
+	return !strings.EqualFold(os.Getenv("NATIVE_TOOL_BRIDGE"), "off")
+}
+
+// WithoutNativeEquivalent 挑出上游没有内置对应物的工具。
+//
+// 读文件、跑命令、搜索这类工具上游本来就有，交给原生桥接即可；只有客户端自己定义的
+// 业务工具（比如「录入发票」）才需要靠提示词协议模拟。区分开来能少注入一大段提示词，
+// 也避免模型把它当成可疑的额外指令。
+func WithoutNativeEquivalent(defs []Definition) []Definition {
+	if !NativeBridgeEnabled() {
+		return defs
+	}
+	out := make([]Definition, 0, len(defs))
+	for _, d := range defs {
+		if !hasNativeEquivalent(d.Name) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func hasNativeEquivalent(name string) bool {
+	for _, names := range candidateNames {
+		for _, want := range names {
+			if strings.EqualFold(name, want) {
+				return true
+			}
+		}
+	}
+	return false
 }
