@@ -254,7 +254,7 @@ export const api = {
 
 /** 流式测试对话：逐段回调增量，返回一个可中止的句柄。 */
 export function streamTestChat(
-  body: { model: string; prompt: string; accountId?: string },
+  body: { model: string; prompt: string; accountId?: string; images?: string[] },
   handlers: {
     onDelta: (d: { content?: string; reasoning?: string }) => void
     onError: (message: string) => void

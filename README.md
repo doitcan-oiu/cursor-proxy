@@ -192,6 +192,24 @@ OpenCode 用 `@ai-sdk/anthropic` 走 `/v1/messages`。有个坑：**自定义模
 
 声明了 `tools` 的客户端不走这条路径，调用会原样转成 `tool_calls` / `tool_use`。
 
+### 多模态（图片）
+
+两个端点都支持带图提问，图片会真正送到模型，不是拍平成文字后丢掉：
+
+- OpenAI：`content` 数组里的 `{"type":"image_url","image_url":{"url":"..."}}`，
+  `url` 支持 `data:` 内联与 `http(s):` 链接（后者由代理代为拉取）。
+- Anthropic：`{"type":"image","source":{...}}`，支持 `type: base64` 与 `type: url`；
+  `tool_result` 里夹带的图片也会被取出。
+- 单张上限 20MB，超了直接拒绝；坏图只跳过并记一行日志，不会让整轮对话失败。
+- 调试台可以直接点选、粘贴截图或拖入图片来试。
+
+实现上，图片挂在 agent 协议的 `UserMessage.selected_context.selected_images` 里
+（字段号取自 Cursor 客户端自带的 `agent.v1` 描述），走内联 `data` 而不是先上传拿 blob。
+
+模型能力实测：`claude-4.6-opus-max`、`gpt-5.2`、`gemini-3.1-pro`、`cursor-grok-4.6-high`、
+`composer-2.5`、`glm-5.2-high` 都能正确读图；`kimi-k3-high` 会直接回「无法查看图片」。
+不支持视觉的模型只是答不出来，不会报错。
+
 ### 关于 `usage`
 
 Cursor 上游不返回 token 用量，所以这里由本地计算，见 `internal/tokenize`：

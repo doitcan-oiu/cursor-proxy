@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -28,6 +29,16 @@ type anthropicBlock struct {
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"`
 	IsError   bool            `json:"is_error"`
+	// image
+	Source *anthropicSource `json:"source"`
+}
+
+// anthropicSource 是 image 块的图片来源：base64 内联或 url 链接。
+type anthropicSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+	URL       string `json:"url"`
 }
 
 type anthropicMessage struct {
@@ -134,13 +145,56 @@ func blocksToText(raw json.RawMessage) string {
 	return sb.String()
 }
 
+// blocksToImages 取出内容块里的 image。tool_result 里也可能嵌图片，一并递归取出。
+// 单张图片解不开只跳过它，不让整轮对话失败。
+func blocksToImages(raw json.RawMessage) []types.Image {
+	if len(raw) == 0 {
+		return nil
+	}
+	var blocks []anthropicBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil
+	}
+	var out []types.Image
+	for _, b := range blocks {
+		switch b.Type {
+		case "tool_result":
+			out = append(out, blocksToImages(b.Content)...)
+		case "image":
+			if b.Source == nil {
+				continue
+			}
+			var (
+				img types.Image
+				err error
+			)
+			switch b.Source.Type {
+			case "url":
+				img, err = types.DecodeImageURL(b.Source.URL)
+			default:
+				img, err = types.DecodeImageBase64(b.Source.MediaType, b.Source.Data)
+			}
+			if err != nil {
+				log.Printf("[image] 忽略一张无法解析的图片: %s", err)
+				continue
+			}
+			out = append(out, img)
+		}
+	}
+	return out
+}
+
 func anthropicToInternal(body anthropicBody) []types.Message {
 	var msgs []types.Message
 	if sys := blocksToText(body.System); sys != "" {
 		msgs = append(msgs, types.Message{Role: "system", Content: sys})
 	}
 	for _, m := range body.Messages {
-		msgs = append(msgs, types.Message{Role: m.Role, Content: blocksToText(m.Content)})
+		msgs = append(msgs, types.Message{
+			Role:    m.Role,
+			Content: blocksToText(m.Content),
+			Images:  blocksToImages(m.Content),
+		})
 	}
 	return msgs
 }

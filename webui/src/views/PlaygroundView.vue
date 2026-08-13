@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { BrainIcon, PlayIcon, SquareIcon, Trash2Icon } from '@lucide/vue'
+import { BrainIcon, ImagePlusIcon, PlayIcon, SquareIcon, Trash2Icon, XIcon } from '@lucide/vue'
 import { toast } from 'vue-sonner'
 import PageHeader from '@/components/app/PageHeader.vue'
 import SurfaceCard from '@/components/app/SurfaceCard.vue'
@@ -29,11 +29,68 @@ const error = ref('')
 const running = ref(false)
 const elapsed = ref(0)
 
+/** 已附带的图片，以 data URL 保存，发送时原样交给后端解码。 */
+type Attachment = { name: string; url: string; size: number }
+const images = ref<Attachment[]>([])
+const dragging = ref(false)
+const fileInput = ref<HTMLInputElement | null>(null)
+
+// 与后端 types.MaxImageBytes 对齐，超了先在本地拦下
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
 let handle: { abort: () => void } | null = null
 let ticker: number | undefined
 
+function readAsDataURL(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(new Error('读取失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+async function addFiles(files: FileList | File[] | null) {
+  if (!files) return
+  for (const file of Array.from(files)) {
+    if (!file.type.startsWith('image/')) {
+      toast.error(`${file.name} 不是图片`)
+      continue
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      toast.error(`${file.name} 超过 20MB`)
+      continue
+    }
+    try {
+      images.value.push({ name: file.name || '粘贴的图片', url: await readAsDataURL(file), size: file.size })
+    } catch {
+      toast.error(`${file.name} 读取失败`)
+    }
+  }
+}
+
+function onPaste(e: ClipboardEvent) {
+  const files = Array.from(e.clipboardData?.items ?? [])
+    .filter((i) => i.kind === 'file')
+    .map((i) => i.getAsFile())
+    .filter((f): f is File => f !== null)
+  if (files.length > 0) {
+    e.preventDefault()
+    void addFiles(files)
+  }
+}
+
+function onDrop(e: DragEvent) {
+  dragging.value = false
+  void addFiles(e.dataTransfer?.files ?? null)
+}
+
+function formatSize(bytes: number) {
+  return bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
 function run() {
-  if (!prompt.value.trim() || running.value) return
+  if ((!prompt.value.trim() && images.value.length === 0) || running.value) return
   content.value = ''
   reasoning.value = ''
   error.value = ''
@@ -51,7 +108,12 @@ function run() {
   }
 
   handle = streamTestChat(
-    { model: model.value, prompt: prompt.value, accountId: accountId.value === '__auto__' ? '' : accountId.value },
+    {
+      model: model.value,
+      prompt: prompt.value,
+      accountId: accountId.value === '__auto__' ? '' : accountId.value,
+      images: images.value.map((i) => i.url),
+    },
     {
       onDelta: (d) => {
         if (d.content) content.value += d.content
@@ -135,11 +197,68 @@ onUnmounted(() => {
 
           <div>
             <label class="mb-1.5 block text-[13px] font-semibold text-charcoal">提示词</label>
-            <Textarea v-model="prompt" rows="7" class="resize-y rounded-md text-[13px]" />
+            <Textarea
+              v-model="prompt"
+              rows="7"
+              class="resize-y rounded-md text-[13px]"
+              @paste="onPaste"
+            />
+          </div>
+
+          <!-- 图片：验证多模态。支持点选、粘贴、拖入 -->
+          <div>
+            <div class="mb-1.5 flex items-center justify-between">
+              <label class="text-[13px] font-semibold text-charcoal">图片</label>
+              <Button variant="ghost" size="sm" @click="fileInput?.click()">
+                <ImagePlusIcon />
+                添加
+              </Button>
+            </div>
+
+            <input
+              ref="fileInput"
+              type="file"
+              accept="image/*"
+              multiple
+              class="hidden"
+              @change="addFiles(($event.target as HTMLInputElement).files); ($event.target as HTMLInputElement).value = ''"
+            />
+
+            <div
+              class="rounded-md border border-dashed px-3 py-3 transition-colors"
+              :class="dragging ? 'border-accent bg-accent-bg' : 'border-hairline'"
+              @dragover.prevent="dragging = true"
+              @dragleave.prevent="dragging = false"
+              @drop.prevent="onDrop"
+            >
+              <div v-if="images.length === 0" class="text-center text-[12px] text-stone">
+                拖入图片，或在提示词里直接粘贴截图
+              </div>
+
+              <div v-else class="flex flex-wrap gap-2">
+                <div
+                  v-for="(img, i) in images"
+                  :key="i"
+                  class="group relative overflow-hidden rounded-md border border-hairline"
+                >
+                  <img :src="img.url" :alt="img.name" class="size-16 object-cover" />
+                  <button
+                    class="absolute right-0.5 top-0.5 rounded bg-ink/70 p-0.5 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                    :title="`移除 ${img.name}`"
+                    @click="images.splice(i, 1)"
+                  >
+                    <XIcon class="size-3" />
+                  </button>
+                  <span
+                    class="absolute inset-x-0 bottom-0 bg-ink/60 px-1 text-center text-[10px] text-white tabular"
+                  >{{ formatSize(img.size) }}</span>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="flex items-center gap-2">
-            <Button v-if="!running" class="flex-1" :disabled="!prompt.trim()" @click="run">
+            <Button v-if="!running" class="flex-1" :disabled="!prompt.trim() && images.length === 0" @click="run">
               <PlayIcon />
               发送
             </Button>

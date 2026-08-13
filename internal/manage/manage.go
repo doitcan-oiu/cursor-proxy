@@ -230,14 +230,42 @@ type TestChatResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// TestChatRequest 是调试台发起一次测试对话的入参。
+type TestChatRequest struct {
+	Model     string `json:"model"`
+	Prompt    string `json:"prompt"`
+	AccountID string `json:"accountId"`
+	// Images 是 data: URL 形式的图片，用于测试多模态。
+	Images []string `json:"images,omitempty"`
+}
+
+// messages 把入参组装成一条用户消息，解不开的图片直接跳过。
+func (r TestChatRequest) messages() ([]types.Message, string) {
+	msg := types.Message{Role: "user", Content: r.Prompt}
+	var skipped string
+	for _, u := range r.Images {
+		img, err := types.DecodeImageURL(u)
+		if err != nil {
+			skipped = err.Error()
+			continue
+		}
+		msg.Images = append(msg.Images, img)
+	}
+	return []types.Message{msg}, skipped
+}
+
 // TestChat 用指定账号（或自动选一个）跑一句。
-func TestChat(model, prompt, accountID string) TestChatResult {
-	entry, ok := pickAccount(accountID)
+func TestChat(req TestChatRequest) TestChatResult {
+	entry, ok := pickAccount(req.AccountID)
 	if !ok {
 		return TestChatResult{Error: "no account"}
 	}
+	msgs, skipped := req.messages()
+	if skipped != "" {
+		return TestChatResult{Error: "图片无法解析: " + skipped}
+	}
 	ctx := cursor.BuildContext(entry.ID, entry.Token, true)
-	stream, err := cursor.StreamAgent([]types.Message{{Role: "user", Content: prompt}}, cursor.ResolveUpstreamModel(model), ctx.Bearer, ctx.ProxyURL)
+	stream, err := cursor.StreamAgent(msgs, cursor.ResolveUpstreamModel(req.Model), ctx.Bearer, ctx.ProxyURL)
 	if err != nil {
 		return TestChatResult{Error: err.Error()}
 	}
@@ -268,15 +296,20 @@ type TestDelta struct {
 
 // TestChatStream 流式测试对话：每个增量通过 onDelta 实时回调（供 WebUI SSE 推送）。
 // 返回是否产出过正文。
-func TestChatStream(model, prompt, accountID string, onDelta func(TestDelta)) bool {
-	entry, ok := pickAccount(accountID)
+func TestChatStream(req TestChatRequest, onDelta func(TestDelta)) bool {
+	entry, ok := pickAccount(req.AccountID)
 	if !ok {
 		onDelta(TestDelta{Error: "no account"})
 		return false
 	}
+	msgs, skipped := req.messages()
+	if skipped != "" {
+		onDelta(TestDelta{Error: "图片无法解析: " + skipped})
+		return false
+	}
 	ctx := cursor.BuildContext(entry.ID, entry.Token, true)
-	stream, err := cursor.StreamAgent([]types.Message{{Role: "user", Content: prompt}},
-		cursor.ResolveUpstreamModel(model), ctx.Bearer, ctx.ProxyURL)
+	stream, err := cursor.StreamAgent(msgs,
+		cursor.ResolveUpstreamModel(req.Model), ctx.Bearer, ctx.ProxyURL)
 	if err != nil {
 		onDelta(TestDelta{Error: err.Error()})
 		return false

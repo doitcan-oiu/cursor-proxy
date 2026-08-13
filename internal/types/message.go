@@ -8,6 +8,18 @@ import "fmt"
 type Message struct {
 	Role    string
 	Content any
+	// Images 是这条消息携带的图片。文本走 Content，图片单独走这里——
+	// 上游协议里两者也是分开的字段，拍平成文本会丢掉图片。
+	Images []Image
+}
+
+// Image 是一张待发给上游的图片。
+type Image struct {
+	Data     []byte
+	MimeType string
+	// Width / Height 解不出来时为 0，上游允许不带尺寸。
+	Width  int
+	Height int
 }
 
 // ContentToText 把可能为字符串 / 分块数组的消息内容拍平为纯文本。

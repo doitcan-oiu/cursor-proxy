@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -35,6 +36,40 @@ type rawMessage struct {
 	Name       string          `json:"name"`
 }
 
+// parseImageBlocks 从 OpenAI 的分块内容里取出 image_url。
+//
+// 解不开的图片不会让整个请求失败——多数客户端会一次带好几张，
+// 因为其中一张坏掉就拒绝整轮对话不划算。返回的错误只用于提示。
+func parseImageBlocks(content any) ([]types.Image, []string) {
+	blocks, ok := content.([]any)
+	if !ok {
+		return nil, nil
+	}
+	var images []types.Image
+	var errs []string
+	for _, part := range blocks {
+		p, ok := part.(map[string]any)
+		if !ok || p["type"] != "image_url" {
+			continue
+		}
+		holder, ok := p["image_url"].(map[string]any)
+		if !ok {
+			continue
+		}
+		url, _ := holder["url"].(string)
+		if url == "" {
+			continue
+		}
+		img, err := types.DecodeImageURL(url)
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		images = append(images, img)
+	}
+	return images, errs
+}
+
 // parseMessages 把请求里的消息归一化成内部形态。
 // assistant 的 tool_calls 与 tool 角色的结果都会被还原成文本回放给模型，
 // 否则模型看不到自己上一轮调用了什么、拿到了什么结果。
@@ -46,6 +81,10 @@ func parseMessages(raw []rawMessage) []types.Message {
 			_ = json.Unmarshal(m.Content, &content)
 		}
 		text := types.ContentToText(content)
+		images, imgErrs := parseImageBlocks(content)
+		for _, e := range imgErrs {
+			log.Printf("[image] 忽略一张无法解析的图片: %s", e)
+		}
 
 		switch {
 		case len(m.ToolCalls) > 0:
@@ -73,7 +112,7 @@ func parseMessages(raw []rawMessage) []types.Message {
 			out = append(out, types.Message{Role: "tool", Content: body})
 
 		default:
-			out = append(out, types.Message{Role: m.Role, Content: content})
+			out = append(out, types.Message{Role: m.Role, Content: content, Images: images})
 		}
 	}
 	return out
@@ -489,14 +528,13 @@ func injectToolPrompt(messages []types.Message, defs []tools.Definition, choice 
 	out := make([]types.Message, len(messages))
 	copy(out, messages)
 
-	// 工具说明追加到已有 system 之后，避免打乱客户端自己的系统提示
+	// 工具说明追加到已有 system 之后，避免打乱客户端自己的系统提示。
+	// 注意只改写 Content，Images 必须原样保留——早期版本在这里整个重建了
+	// 结构体，结果「带图 + 声明工具」的请求会把图片丢掉，模型只看到文字。
 	injected := false
 	for i, m := range out {
 		if m.Role == "system" || m.Role == "developer" {
-			out[i] = types.Message{
-				Role:    m.Role,
-				Content: strings.TrimSpace(types.ContentToText(m.Content)) + "\n\n" + prompt,
-			}
+			out[i].Content = strings.TrimSpace(types.ContentToText(m.Content)) + "\n\n" + prompt
 			injected = true
 			break
 		}
@@ -508,10 +546,7 @@ func injectToolPrompt(messages []types.Message, defs []tools.Definition, choice 
 	// 末尾提醒：靠近生成点，压过上游自身 agent 提示词的影响
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i].Role == "user" {
-			out[i] = types.Message{
-				Role:    "user",
-				Content: types.ContentToText(out[i].Content) + tools.Reminder(),
-			}
+			out[i].Content = types.ContentToText(out[i].Content) + tools.Reminder()
 			break
 		}
 	}

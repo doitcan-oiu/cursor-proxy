@@ -80,3 +80,73 @@ func TestEncodeAgentRequestHasEmptyExplicitContext(t *testing.T) {
 		t.Fatalf("消息正文 = %q，期望 %q", text, "hi")
 	}
 }
+
+// 图片挂在 UserMessage.selected_context 里，字段号取自 Cursor 客户端自带的
+// agent.v1 描述。挂错位置上游不会报错，只是模型看不到图——必须锁死结构。
+func TestEncodeAgentRequestCarriesImages(t *testing.T) {
+	msgs := []types.Message{{
+		Role:    "user",
+		Content: "这张图里有什么",
+		Images: []types.Image{
+			{Data: []byte{1, 2, 3}, MimeType: "image/png", Width: 40, Height: 25},
+			{Data: []byte{9, 9}, MimeType: "image/jpeg"},
+		},
+	}}
+
+	top := Decode(EncodeAgentRequest(msgs, "auto"))
+	runReq := Decode(FirstBytes(top, 1))
+	action := Decode(FirstBytes(runReq, 2))
+	userAction := Decode(FirstBytes(action, 1))
+	userMsg := Decode(FirstBytes(userAction, 1))
+
+	if got := FirstString(userMsg, 1); got != "这张图里有什么" {
+		t.Fatalf("正文应照常发送，实际 %q", got)
+	}
+
+	selected := Decode(FirstBytes(userMsg, 3))
+	imgs := selected[1]
+	if len(imgs) != 2 {
+		t.Fatalf("应挂上 2 张图，实际 %d", len(imgs))
+	}
+
+	first := Decode(imgs[0].Bytes)
+	if got := FirstBytes(first, 8); string(got) != "\x01\x02\x03" {
+		t.Fatalf("字段 8 应是图片字节，实际 %q", got)
+	}
+	if got := FirstString(first, 7); got != "image/png" {
+		t.Fatalf("字段 7 应是 MIME，实际 %q", got)
+	}
+	if got := FirstString(first, 2); got == "" {
+		t.Fatal("字段 2 应有 uuid")
+	}
+	dim := Decode(FirstBytes(first, 4))
+	if dim[1][0].Varint != 40 || dim[2][0].Varint != 25 {
+		t.Fatalf("字段 4 应是宽高，实际 %d x %d", dim[1][0].Varint, dim[2][0].Varint)
+	}
+
+	// 没有尺寸的图不写 dimension，但字节和 MIME 照发
+	second := Decode(imgs[1].Bytes)
+	if FirstBytes(second, 4) != nil {
+		t.Fatal("尺寸未知时不应写 dimension")
+	}
+	if string(FirstBytes(second, 8)) != "\x09\x09" {
+		t.Fatal("第二张图的字节应保留")
+	}
+}
+
+// 没有图片时结构要和以前一致：字段 3 存在但为空。
+// 早期版本这里发的是空字符串，改成空消息后行为等价，别回退成不发。
+func TestEncodeAgentRequestWithoutImages(t *testing.T) {
+	top := Decode(EncodeAgentRequest([]types.Message{{Role: "user", Content: "hi"}}, "auto"))
+	runReq := Decode(FirstBytes(top, 1))
+	action := Decode(FirstBytes(runReq, 2))
+	userAction := Decode(FirstBytes(action, 1))
+	userMsg := Decode(FirstBytes(userAction, 1))
+
+	if _, ok := userMsg[3]; !ok {
+		t.Fatal("字段 3 应存在")
+	}
+	if len(FirstBytes(userMsg, 3)) != 0 {
+		t.Fatal("没有图片时字段 3 应为空")
+	}
+}

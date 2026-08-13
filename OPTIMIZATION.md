@@ -219,6 +219,33 @@ o200k 对中文有大量多字合并 token，启发式会高估约 60%，所以�
 
 改完后同一个 SVG：首块 3.8 秒到达，672 个块持续输出，全程 39.7 秒，内容不再重复。
 
+### ~~P1：图片输入被静默丢弃，多模态完全不可用~~（已在 Go 版修复）
+原版和 Go 早期版本都只从消息里抽文字：`ContentToText` 遍历分块时只取 `part["text"]`，
+OpenAI 的 `image_url` 块与 Anthropic 的 `image` 块没有 `text`，于是被无声丢掉。
+请求照常返回 200，模型回一句「我没有看到图片」——最难排查的那种失败。
+
+修复要点是找到上游的图片通道。Cursor 客户端自带 `agent.v1` 的 protobuf 描述
+（`resources/app/extensions/cursor-local-agent-runtime/dist/main.js`），
+从中可以读到准确的字段号：
+
+```
+UserMessage.3      = SelectedContext        ← 早期版本这里发的是空字符串
+SelectedContext.1  = repeated SelectedImage
+SelectedImage.8    = bytes  data            ← 与 blob_id 同属一个 oneof，可内联
+SelectedImage.7    = string mime_type
+SelectedImage.4    = Dimension { 1: width, 2: height }
+SelectedImage.2/3  = uuid / path
+```
+
+走内联 `data` 就不必先上传拿 blob。实测同一张图：修复前模型答「没有看到图片」，
+修复后能准确念出图中的唯一编号、句子与图形颜色；发票截图能完整转成 JSON
+（编号、4 行商品、小计、税、总计、到期日全对）。
+
+同时修掉一个连带 bug：`injectToolPrompt` 追加工具说明时整个重建了 `types.Message`，
+把新增的 `Images` 字段丢了。表现为「带图 + 声明工具」的请求里模型看不见图，
+只回一句「我没有这个工具」。改成只改写 `Content` 字段后，
+「读发票图 → 调用 record_invoice 工具」这条链路才跑通。
+
 ### P2：`checkAllAccounts` / 批量验号会打真实计费请求
 `get-current-period-usage` 和 `full_stripe_profile` 每次验号都会请求 Cursor 官方接口。账号多时
 一轮全量验号是几十上百个外部请求，且无缓存。建议对 plan/usage 结果做短 TTL 缓存（如 5 分钟），

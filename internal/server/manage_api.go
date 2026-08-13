@@ -166,13 +166,9 @@ func manageHandler() http.Handler {
 	})
 
 	mux.HandleFunc("POST /manage/chat/test", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Model     string `json:"model"`
-			Prompt    string `json:"prompt"`
-			AccountID string `json:"accountId"`
-		}
+		var body manage.TestChatRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		openai.WriteJSON(w, 200, manage.TestChat(body.Model, body.Prompt, body.AccountID))
+		openai.WriteJSON(w, 200, manage.TestChat(body))
 	})
 
 	mux.HandleFunc("POST /manage/chat/test-stream", testChatStream)
@@ -182,11 +178,7 @@ func manageHandler() http.Handler {
 
 // testChatStream 以 SSE 把测试对话的增量实时推给 WebUI。
 func testChatStream(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Model     string `json:"model"`
-		Prompt    string `json:"prompt"`
-		AccountID string `json:"accountId"`
-	}
+	var body manage.TestChatRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
 	flusher, ok := w.(http.Flusher)
@@ -207,7 +199,7 @@ func testChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	done := r.Context().Done()
-	manage.TestChatStream(body.Model, body.Prompt, body.AccountID, func(d manage.TestDelta) {
+	manage.TestChatStream(body, func(d manage.TestDelta) {
 		select {
 		case <-done:
 			// 客户端已断开，丢弃后续增量

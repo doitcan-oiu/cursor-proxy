@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
@@ -42,12 +43,63 @@ func BuildPrompt(messages []types.Message) string {
 	return b.String()
 }
 
+// encodeSelectedImages 构造 UserMessage.selected_context，把图片挂进去。
+//
+// 字段号取自 Cursor 客户端自带的 agent.v1 描述：
+//
+//	SelectedContext { 1: repeated SelectedImage selected_images }
+//	SelectedImage   { 8: bytes data, 7: string mime_type,
+//	                  2: string uuid, 3: string path,
+//	                  4: Dimension { 1: int32 width, 2: int32 height } }
+//
+// data 与 blob_id 是同一个 oneof，这里走内联 data，不用先上传拿 blob。
+func encodeSelectedImages(images []types.Image) []byte {
+	ctx := NewWriter()
+	for i, img := range images {
+		if len(img.Data) == 0 {
+			continue
+		}
+		sel := NewWriter()
+		sel.Bytes(8, img.Data)
+		sel.Str(2, uuid.NewString())
+		// path 只是给模型看的标识，客户端发的图没有真实路径
+		sel.Str(3, fmt.Sprintf("image-%d%s", i+1, extForMime(img.MimeType)))
+		if img.Width > 0 && img.Height > 0 {
+			dim := NewWriter()
+			dim.Int32(1, img.Width)
+			dim.Int32(2, img.Height)
+			sel.Bytes(4, dim.Finish())
+		}
+		if img.MimeType != "" {
+			sel.Str(7, img.MimeType)
+		}
+		ctx.Bytes(1, sel.Finish())
+	}
+	return ctx.Finish()
+}
+
+func extForMime(mime string) string {
+	switch mime {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ".png"
+	}
+}
+
 // EncodeAgentRequest 构造 agentn.api5 的 AgentClientMessage/AgentRunRequest（未加 Connect 信封）。
 func EncodeAgentRequest(messages []types.Message, modelID string) []byte {
 	userMsg := NewWriter()
 	userMsg.Str(1, BuildPrompt(messages))
 	userMsg.Str(2, uuid.NewString())
-	userMsg.Str(3, "")
+	// 字段 3 是 SelectedContext。没有图片时发空消息，行为与之前一致。
+	userMsg.Bytes(3, encodeSelectedImages(types.CollectImages(messages)))
 
 	// ExplicitContext 是必填的：完全省略这个字段时上游会接受请求但一个字都不生成。
 	// 这里给一个空上下文，避免伪造文件让 agent 以为身处代码工作区。
