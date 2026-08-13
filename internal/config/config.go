@@ -12,10 +12,17 @@ import (
 
 // Antiban 汇总账号调度 / 防封相关旋钮。
 type Antiban struct {
-	MinIntervalMs          int
-	MaxConcurrency         int
-	JitterMs               int
-	Cooldown429Ms          int
+	MinIntervalMs  int
+	MaxConcurrency int
+	JitterMs       int
+	// Cooldown429Ms 被限流后暂停使用该账号的时长；0 表示不冷却（默认）。
+	Cooldown429Ms int
+	// QuarantineMs 连续失败后隔离该账号的时长；0 表示不隔离（默认）。
+	//
+	// 默认关闭是因为「失败」这个信号并不可靠：上游抖动、区域限制、模型名无效
+	// 都会被算成账号故障，攒够几次就把一个其实好用的账号下线半小时，
+	// 池子小的时候直接变成「无可用账号」。现在改为只降权不下线——
+	// 最近失败过的账号排到最后，但仍然可选，成功一次立刻恢复优先级。
 	QuarantineMs           int
 	MaxConsecutiveFailures int
 	MaxAttempts            int
@@ -151,8 +158,8 @@ func Get() *Config {
 				MinIntervalMs:          envInt("ACCOUNT_MIN_INTERVAL_MS", 0),
 				MaxConcurrency:         envInt("ACCOUNT_MAX_CONCURRENCY", 64),
 				JitterMs:               envInt("ACCOUNT_JITTER_MS", 0),
-				Cooldown429Ms:          envInt("ACCOUNT_COOLDOWN_429_MS", 60000),
-				QuarantineMs:           envInt("ACCOUNT_QUARANTINE_MS", 1800000),
+				Cooldown429Ms:          envInt("ACCOUNT_COOLDOWN_429_MS", 0),
+				QuarantineMs:           envInt("ACCOUNT_QUARANTINE_MS", 0),
 				MaxConsecutiveFailures: envInt("ACCOUNT_MAX_FAILURES", 3),
 				MaxAttempts:            envInt("PROXY_MAX_ATTEMPTS", 3),
 				AcquireTimeoutMs:       envInt("ACCOUNT_ACQUIRE_TIMEOUT_MS", 30000),

@@ -273,6 +273,16 @@ onMounted(load)
                 <Badge v-else-if="healthOf[acc.id]?.cooldownForMs" variant="warn">冷却中</Badge>
                 <Badge v-else-if="healthOf[acc.id]?.available" variant="success">可用</Badge>
                 <Badge v-else variant="neutral">—</Badge>
+
+                <!-- 失败默认不再让账号下线，但连续失败要看得见，
+                     否则一个已经废掉的号只会表现为「每次请求都慢一点」 -->
+                <div
+                  v-if="healthOf[acc.id]?.consecutiveFailures"
+                  class="mt-1 text-[12px] text-danger tabular"
+                  :title="healthOf[acc.id]?.lastError || '连续失败，已排到调度末位'"
+                >
+                  连败 {{ healthOf[acc.id].consecutiveFailures }} 次
+                </div>
                 <div v-if="healthOf[acc.id]?.inFlight" class="mt-1 text-[12px] text-steel tabular">
                   {{ healthOf[acc.id].inFlight }} 在途
                 </div>

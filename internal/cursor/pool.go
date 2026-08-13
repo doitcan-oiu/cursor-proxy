@@ -26,13 +26,30 @@ const (
 )
 
 type health struct {
-	inFlight            int
-	lastStartAt         int64
-	cooldownUntil       int64
-	disabledUntil       int64
+	inFlight      int
+	lastStartAt   int64
+	cooldownUntil int64
+	disabledUntil int64
+	// consecutiveFailures 连续失败次数。默认只用来排序（失败多的排后面），
+	// 不再让账号变成不可用——上游抖动被算成账号故障，攒够几次就把好账号
+	// 隔离半小时，池子小的时候等于自断手脚。
 	consecutiveFailures int
-	lastOutcome         Outcome
-	lastError           string
+	// lastFailureAt 最近一次失败的时间，用于让降权随时间自然消退。
+	lastFailureAt int64
+	lastOutcome   Outcome
+	lastError     string
+}
+
+// failurePenaltyMs 是失败降权的有效期。
+// 过了这段时间就当没失败过，避免一次偶发抖动永久压着某个账号。
+const failurePenaltyMs = 5 * 60 * 1000
+
+// penalty 给出排序用的降权分：数值越大越靠后。
+func (h *health) penalty(now int64) int {
+	if h.consecutiveFailures == 0 || now-h.lastFailureAt > failurePenaltyMs {
+		return 0
+	}
+	return h.consecutiveFailures
 }
 
 var (
@@ -140,7 +157,13 @@ func AcquireAccount(exclude map[string]bool) *AcquiredAccount {
 			return nil
 		}
 		if len(usable) > 0 {
+			// 先按最近是否失败过分层：失败过的排到后面但仍然可用。
+			// 这是隔离的替代方案——坏账号不会拖慢每个请求，好账号也不会被误伤下线。
 			sort.Slice(usable, func(a, b int) bool {
+				pa, pb := usable[a].h.penalty(now), usable[b].h.penalty(now)
+				if pa != pb {
+					return pa < pb
+				}
 				if usable[a].h.inFlight != usable[b].h.inFlight {
 					return usable[a].h.inFlight < usable[b].h.inFlight
 				}
@@ -201,19 +224,33 @@ func ReleaseAccount(id string, outcome Outcome, errorMsg string) {
 	h.lastOutcome = outcome
 	h.lastError = errorMsg
 	now := nowMs()
+
+	// 失败默认不再让账号下线，只记账用于排序。
+	// 冷却与隔离都要显式配了时长才生效（ACCOUNT_COOLDOWN_429_MS / ACCOUNT_QUARANTINE_MS），
+	// 默认 0 表示关闭：上游抖动、区域限制、模型不可用这些都会被算成账号故障，
+	// 按老逻辑攒够几次就把一个其实好用的账号隔离半小时，池子小的时候直接没号可用。
 	switch outcome {
 	case OutcomeSuccess:
 		h.consecutiveFailures = 0
+		h.lastFailureAt = 0
 		h.cooldownUntil = 0
 		h.disabledUntil = 0
 	case OutcomeRateLimited:
-		h.cooldownUntil = now + int64(ab.Cooldown429Ms)
+		h.consecutiveFailures++
+		h.lastFailureAt = now
+		if ab.Cooldown429Ms > 0 {
+			h.cooldownUntil = now + int64(ab.Cooldown429Ms)
+		}
 	case OutcomeAuthFailed:
 		h.consecutiveFailures++
-		h.disabledUntil = now + int64(ab.QuarantineMs)
+		h.lastFailureAt = now
+		if ab.QuarantineMs > 0 {
+			h.disabledUntil = now + int64(ab.QuarantineMs)
+		}
 	case OutcomeError:
 		h.consecutiveFailures++
-		if h.consecutiveFailures >= ab.MaxConsecutiveFailures {
+		h.lastFailureAt = now
+		if ab.QuarantineMs > 0 && h.consecutiveFailures >= ab.MaxConsecutiveFailures {
 			h.disabledUntil = now + int64(ab.QuarantineMs)
 		}
 	}
