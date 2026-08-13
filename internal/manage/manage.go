@@ -375,35 +375,19 @@ func toolText(c *cursor.NativeToolCall) string {
 }
 
 // nativeOf 把 cursor 层的内置调用转成 tools 层的形态。
+// 两边的类型值是同一批字符串，直接转换，不再手写 switch 逐个对应。
 func nativeOf(c *cursor.NativeToolCall) tools.Native {
 	if c == nil {
 		return tools.Native{}
 	}
-	kind := tools.KindUnknown
-	switch c.Kind {
-	case cursor.ToolWriteFile:
-		kind = tools.KindWriteFile
-	case cursor.ToolReadFile:
-		kind = tools.KindReadFile
-	case cursor.ToolRunTerminal:
-		kind = tools.KindRunTerminal
-	case cursor.ToolSearchFiles:
-		kind = tools.KindSearchFiles
-	case cursor.ToolListFiles:
-		kind = tools.KindListFiles
-	case cursor.ToolDeleteFile:
-		kind = tools.KindDeleteFile
-	case cursor.ToolFetchURL:
-		kind = tools.KindFetchURL
-	case cursor.ToolTask:
-		kind = tools.KindTask
-	case cursor.ToolTodoWrite:
-		kind = tools.KindTodoWrite
+	todos := make([]tools.TodoItem, 0, len(c.Todos))
+	for _, t := range c.Todos {
+		todos = append(todos, tools.TodoItem{ID: t.ID, Content: t.Content, Status: t.Status})
 	}
 	return tools.Native{
-		ID: c.ID, Kind: kind, Path: c.Path, Command: c.Command, Pattern: c.Pattern,
-		Content: c.Content, Prompt: c.Prompt, URL: c.URL,
-		Description: c.Description, Field: c.Field,
+		ID: c.ID, Kind: tools.NativeKind(c.Kind), Path: c.Path, Command: c.Command,
+		Pattern: c.Pattern, Content: c.Content, Prompt: c.Prompt, URL: c.URL,
+		Description: c.Description, Field: c.Field, Name: c.Name, Todos: todos,
 	}
 }
 

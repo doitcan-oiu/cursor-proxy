@@ -180,3 +180,94 @@ func TestDescribeNativeFallback(t *testing.T) {
 		t.Fatal("兜底描述不应为空")
 	}
 }
+
+// 待办清单是数组参数，走不了通用的「单值填一个属性」那套。
+// 客户端声明了待办工具时应真正映射过去，而不是只渲染成文本。
+func TestMapNativeUpdateTodos(t *testing.T) {
+	defs := []Definition{{
+		Name:       "TodoWrite",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array"}},"required":["todos"]}`),
+	}}
+	n := Native{ID: "c1", Kind: KindUpdateTodos, Todos: []TodoItem{
+		{ID: "1", Content: "调研", Status: "in_progress"},
+		{Content: "起草", Status: "pending"},
+	}}
+
+	call, ok := MapNative(n, defs)
+	if !ok {
+		t.Fatal("客户端声明了待办工具，应该能映射")
+	}
+	if call.Name != "TodoWrite" {
+		t.Fatalf("工具名不对：%q", call.Name)
+	}
+
+	var got struct {
+		Todos []struct {
+			ID      string `json:"id"`
+			Content string `json:"content"`
+			Status  string `json:"status"`
+		} `json:"todos"`
+	}
+	if err := json.Unmarshal([]byte(call.Arguments), &got); err != nil {
+		t.Fatalf("参数应是合法 JSON：%v (%s)", err, call.Arguments)
+	}
+	if len(got.Todos) != 2 {
+		t.Fatalf("应有 2 条待办，实际 %d", len(got.Todos))
+	}
+	if got.Todos[0].Content != "调研" || got.Todos[0].Status != "in_progress" {
+		t.Fatalf("第一条不对：%+v", got.Todos[0])
+	}
+	// 上游没给 id 时要补一个，客户端多半要求必填
+	if got.Todos[1].ID == "" {
+		t.Fatal("缺失的 id 应自动补上")
+	}
+}
+
+// 没声明待办工具的客户端仍然回退到文本，并且要带上状态标注。
+func TestDescribeTodosFallsBackToText(t *testing.T) {
+	n := Native{Kind: KindUpdateTodos, Todos: []TodoItem{
+		{Content: "调研", Status: "in_progress"},
+		{Content: "校对", Status: "pending"},
+	}}
+	if _, ok := MapNative(n, nil); ok {
+		t.Fatal("没有可映射的客户端工具时应返回 false")
+	}
+	text := NativeToText(n)
+	for _, want := range []string{"调研", "校对", "进行中", "待办"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("文本里应包含 %q，实际 %q", want, text)
+		}
+	}
+}
+
+// glob 与 grep 是两个不同的工具，早期把它们混在一起，
+// 结果客户端声明的 grep 会被 glob 调用抢走。
+func TestGlobAndGrepMapToDifferentTools(t *testing.T) {
+	defs := []Definition{
+		{Name: "glob", Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"}}}`)},
+		{Name: "grep", Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"}}}`)},
+	}
+	globCall, ok := MapNative(Native{Kind: KindGlob, Pattern: "**/*.go"}, defs)
+	if !ok || globCall.Name != "glob" {
+		t.Fatalf("glob 应映射到 glob，实际 %+v", globCall)
+	}
+	grepCall, ok := MapNative(Native{Kind: KindSearchFiles, Pattern: "func main"}, defs)
+	if !ok || grepCall.Name != "grep" {
+		t.Fatalf("grep 应映射到 grep，实际 %+v", grepCall)
+	}
+}
+
+// 联网搜索是上游确实存在的内置工具（ToolCall 字段 18）。
+func TestMapNativeWebSearch(t *testing.T) {
+	defs := []Definition{{
+		Name:       "web_search",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}}
+	call, ok := MapNative(Native{Kind: KindWebSearch, Pattern: "golang 手写 protobuf"}, defs)
+	if !ok {
+		t.Fatal("应能映射到客户端的 web_search")
+	}
+	if !strings.Contains(call.Arguments, "golang 手写 protobuf") {
+		t.Fatalf("搜索词应带进参数：%s", call.Arguments)
+	}
+}

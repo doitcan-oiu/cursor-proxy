@@ -113,8 +113,9 @@ onUnmounted(() => window.clearInterval(timer))
           <Badge variant="warn">出现 {{ it.count }} 次</Badge>
         </template>
 
-        <div class="flex flex-wrap items-center gap-2">
-          <Badge variant="code">字段 {{ it.field }}</Badge>
+              <div class="flex flex-wrap items-center gap-2">
+                <Badge v-if="it.name" variant="code">{{ it.name }}</Badge>
+                <Badge variant="code">字段 {{ it.field }}</Badge>
           <span class="text-[13px] text-steel">{{ it.model }}</span>
           <span class="text-[13px] text-stone tabular">{{ formatTime(it.time) }}</span>
         </div>

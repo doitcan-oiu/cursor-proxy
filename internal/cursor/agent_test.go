@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,11 +204,22 @@ func TestParseNativeOtherTools(t *testing.T) {
 			},
 		},
 		{
-			// 这个工具的模式在子字段 2，与搜索不同，最容易写错
-			"列出文件", toolListFiles,
-			func(w *proto.Writer) { w.Str(2, "internal/**/*.go") },
+			// GlobToolArgs 的模式在字段 2，字段 1 是可选的起始目录。
+			// 早期把这个字段当成了「列出文件」，其实上游叫 glob，ls 是另一个字段。
+			"按文件名查找", toolGlob,
+			func(w *proto.Writer) { w.Str(1, "internal"); w.Str(2, "**/*.go") },
 			func(t *testing.T, c NativeToolCall) {
-				if c.Kind != ToolListFiles || c.Pattern != "internal/**/*.go" {
+				if c.Kind != ToolGlob || c.Pattern != "**/*.go" || c.Path != "internal" {
+					t.Fatalf("%+v", c)
+				}
+			},
+		},
+		{
+			// LsArgs 的路径在字段 1，与 glob 完全不同
+			"列出目录", toolListFiles,
+			func(w *proto.Writer) { w.Str(1, "/tmp/dir") },
+			func(t *testing.T, c NativeToolCall) {
+				if c.Kind != ToolListFiles || c.Path != "/tmp/dir" {
 					t.Fatalf("%+v", c)
 				}
 			},
@@ -217,6 +229,25 @@ func TestParseNativeOtherTools(t *testing.T) {
 			func(w *proto.Writer) { w.Str(1, "https://example.com") },
 			func(t *testing.T, c NativeToolCall) {
 				if c.Kind != ToolFetchURL || c.URL != "https://example.com" {
+					t.Fatalf("%+v", c)
+				}
+			},
+		},
+		{
+			// 字段 24 是另一个抓取工具，参数结构与 37 相同
+			"抓取网页（另一入口）", toolFetch,
+			func(w *proto.Writer) { w.Str(1, "https://example.org") },
+			func(t *testing.T, c NativeToolCall) {
+				if c.Kind != ToolFetchURL || c.URL != "https://example.org" {
+					t.Fatalf("%+v", c)
+				}
+			},
+		},
+		{
+			"联网搜索", toolWebSearch,
+			func(w *proto.Writer) { w.Str(1, "golang protobuf 手写解析") },
+			func(t *testing.T, c NativeToolCall) {
+				if c.Kind != ToolWebSearch || c.Pattern != "golang protobuf 手写解析" {
 					t.Fatalf("%+v", c)
 				}
 			},
@@ -687,6 +718,169 @@ func TestNormalEndIsNotTruncated(t *testing.T) {
 	for ev := range events {
 		if ev.Kind == EventEnd && ev.Truncated {
 			t.Fatal("正常收尾不应标记为截断")
+		}
+	}
+}
+
+// 用户导出的「未识别工具」里出现最多的就是这个：字段 9 = update_todos。
+// 原样复刻导出的结构，确保补上的映射与真实报文一致。
+func TestParseNativeUpdateTodos(t *testing.T) {
+	item := proto.NewWriter()
+	item.Str(1, "1")
+	item.Str(2, "Continue the roleplay narrative at Round 52")
+	item.Int32(3, 2) // TODO_STATUS_IN_PROGRESS
+	second := proto.NewWriter()
+	second.Str(1, "2")
+	second.Str(2, "整理本轮要点")
+	second.Int32(3, 1) // TODO_STATUS_PENDING
+
+	args := proto.NewWriter()
+	args.Bytes(1, item.Finish())
+	args.Bytes(1, second.Finish())
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_todo", toolUpdateTodos, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 {
+		t.Fatalf("应解析出 1 个调用，得到 %+v", calls)
+	}
+	c := calls[0]
+	if c.Kind != ToolUpdateTodos {
+		t.Fatalf("应识别为 update_todos，实际 %q", c.Kind)
+	}
+	if len(c.Todos) != 2 {
+		t.Fatalf("应解析出 2 条待办，实际 %d", len(c.Todos))
+	}
+	if c.Todos[0].Content != "Continue the roleplay narrative at Round 52" {
+		t.Fatalf("第一条内容不对：%q", c.Todos[0].Content)
+	}
+	if c.Todos[0].Status != "in_progress" || c.Todos[1].Status != "pending" {
+		t.Fatalf("状态解析不对：%q / %q", c.Todos[0].Status, c.Todos[1].Status)
+	}
+}
+
+// 字段 42 = await。它的参数可以全为空（等待任意任务），
+// 所以不能用「字段非空」来判断这次调用存在，否则会被误报成未识别工具。
+func TestParseNativeAwait(t *testing.T) {
+	args := proto.NewWriter()
+	args.Int32(2, 1) // block_until_ms
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_await", toolAwait, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 || calls[0].Kind != ToolAwait {
+		t.Fatalf("应识别为 await，实际 %+v", calls)
+	}
+}
+
+// 还不解析参数的工具也要能报出上游给它的规范名，
+// 只给字段号的话补映射时还得再查一次描述文件。
+func TestUnknownToolCarriesUpstreamName(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "screenshot payload")
+
+	var data []byte
+	data = append(data, toolCallFrame("toolu_rec", 29, args)...) // record_screen
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 {
+		t.Fatalf("未识别工具也应下发，实际 %+v", calls)
+	}
+	if calls[0].Kind != ToolUnknown || calls[0].Name != "record_screen" {
+		t.Fatalf("应报出规范名 record_screen，实际 kind=%q name=%q", calls[0].Kind, calls[0].Name)
+	}
+}
+
+// 参数容器里的附带字段（tool_call_id、时间戳等）不是工具，
+// 扫描未识别工具时必须跳过，否则每次调用都会多报一个假的「未知工具」。
+func TestMetaFieldsAreNotReportedAsTools(t *testing.T) {
+	inner := proto.NewWriter()
+	inner.Str(1, "/tmp/a.txt")
+	wrapper := proto.NewWriter()
+	wrapper.Bytes(toolReadFile, proto.NewWriter().Bytes(1, inner.Finish()).Finish())
+	wrapper.Str(57, "toolu_meta") // tool_call_id
+	wrapper.Int32(59, 1786585216) // started_at_ms
+	wrapper.Int32(60, 1786585217) // completed_at_ms
+
+	done := proto.NewWriter()
+	done.Str(1, "toolu_meta")
+	done.Bytes(2, wrapper.Finish())
+	sm := proto.NewWriter()
+	sm.Bytes(smToolCallDone, done.Finish())
+	top := proto.NewWriter()
+	top.Bytes(fieldStreamMessage, sm.Finish())
+
+	var data []byte
+	data = append(data, frame(0x00, top.Finish())...)
+	data = append(data, conversationFrame(4)...)
+
+	calls := collectTools(t, data)
+	if len(calls) != 1 {
+		t.Fatalf("应只解析出 1 个调用，实际 %+v", calls)
+	}
+	if calls[0].Kind != ToolReadFile {
+		t.Fatalf("应识别为读文件，实际 %q", calls[0].Kind)
+	}
+}
+
+// 上游有时只发「进行中」帧宣告要用某工具，然后既不给参数也不发完成帧
+// （实测 web_search 就是这样）。客户端只会收到模型那句「我这就去搜索…」
+// 然后流正常结束，看起来像说完了——必须补一句说明，不能静默。
+func TestAnnouncedButUnfinishedToolIsReported(t *testing.T) {
+	var data []byte
+	data = append(data, contentFrame("I'll search for that.")...)
+	data = append(data, progressFrame("toolu_ws", toolWebSearch, "")...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var text string
+	for ev := range events {
+		if ev.Kind == EventDelta {
+			text += ev.Text
+		}
+	}
+	if !strings.Contains(text, "web_search") {
+		t.Fatalf("应说明是哪个工具没做完，实际 %q", text)
+	}
+	if !strings.Contains(text, "没有给出参数") {
+		t.Fatalf("应说明原因，实际 %q", text)
+	}
+}
+
+// 正常完成的工具调用不能被误报成「宣告了没做完」。
+func TestCompletedToolIsNotReportedAsUnfinished(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "/tmp/a.py")
+	args.Str(6, "print(1)\n")
+
+	var data []byte
+	data = append(data, progressFrame("toolu_w1", toolWriteFile, "/tmp/a.py")...)
+	data = append(data, toolCallFrame("toolu_w1", toolWriteFile, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	for ev := range events {
+		if ev.Kind == EventDelta && strings.Contains(ev.Text, "没有给出参数") {
+			t.Fatalf("已完成的调用不应被报成未完成：%q", ev.Text)
 		}
 	}
 }

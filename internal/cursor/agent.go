@@ -268,9 +268,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 			return
 		case <-timer.C:
 			if state.turnComplete || state.gotContent || state.sawToolCall {
-				if !state.errored {
-					send(StreamEvent{Kind: EventEnd})
-				}
+				state.finish(send, false)
 				return
 			}
 			if time.Since(start) > firstToken {
@@ -286,8 +284,8 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 				if !state.errored && ch.err != io.EOF && !state.gotContent && !state.turnComplete {
 					send(StreamEvent{Kind: EventError, Message: ch.err.Error()})
 					state.errored = true
-				} else if !state.errored {
-					send(StreamEvent{Kind: EventEnd})
+				} else {
+					state.finish(send, false)
 				}
 				return
 			}
@@ -297,16 +295,12 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 			if time.Since(start) > hardCap {
 				log.Printf("[agent] 达到 %s 时长上限，本轮被截断（已输出 %d 字节）",
 					hardCap, state.textBytes)
-				if !state.errored {
-					send(StreamEvent{Kind: EventEnd, Truncated: true})
-				}
+				state.finish(send, true)
 				return
 			}
 			buffer = append(buffer, ch.data...)
 			if endOfStream := state.process(&buffer, send); endOfStream {
-				if !state.errored {
-					send(StreamEvent{Kind: EventEnd})
-				}
+				state.finish(send, false)
 				return
 			}
 		}
@@ -328,6 +322,34 @@ const (
 	smToolInputDelta   = 15 // 参数流式片段：{ 1: 调用 id, 2{3{1: 文本片段}} }
 )
 
+// finish 统一收尾：先把「宣告了却没完成」的工具调用交代清楚，再结束本轮。
+//
+// 上游偶尔会发一个「进行中」帧宣告要用某工具，然后既不发参数也不发完成帧
+// （实测 web_search 就是这样，参数长度 0，两次都没有下文）。此时客户端只会
+// 收到模型那句「我这就去搜索…」，然后流就正常结束了——看起来像模型自己
+// 说完了，其实是这一轮没做完。宁可多一句说明，也不要静默。
+func (s *agentStreamState) finish(send func(StreamEvent) bool, truncated bool) {
+	if s.errored {
+		return
+	}
+	for id, kind := range s.announced {
+		if s.emitted[id] {
+			continue
+		}
+		name := string(kind)
+		if name == "" {
+			name = "未知"
+		}
+		log.Printf("[cursor] 上游宣告了工具 %s 却没有下发参数，本轮可能未完成", name)
+		if !send(StreamEvent{Kind: EventDelta, Text: fmt.Sprintf(
+			"\n\n（上游想调用内置工具 %s，但没有给出参数，本轮就此结束。"+
+				"该工具可能在当前账号或模型下不可用。）", name)}) {
+			return
+		}
+	}
+	send(StreamEvent{Kind: EventEnd, Truncated: truncated})
+}
+
 // parseToolProgress 从「进行中」帧里取出调用 id、工具类型与已知路径。
 // 参数还没发完，但类型和路径先到，足以判断后续片段要不要流式输出。
 func parseToolProgress(sm map[int][]proto.Field) (id string, kind NativeToolKind, path string, ok bool) {
@@ -342,12 +364,7 @@ func parseToolProgress(sm map[int][]proto.Field) (id string, kind NativeToolKind
 		return "", "", "", false
 	}
 	w := proto.Decode(wrapper)
-	for field, kindOf := range map[int]NativeToolKind{
-		toolWriteFile: ToolWriteFile, toolReadFile: ToolReadFile,
-		toolRunTerminal: ToolRunTerminal, toolSearchFiles: ToolSearchFiles,
-		toolListFiles: ToolListFiles, toolDeleteFile: ToolDeleteFile,
-		toolFetchURL: ToolFetchURL, toolTask: ToolTask, toolTodoWrite: ToolTodoWrite,
-	} {
+	for field, kindOf := range toolKinds {
 		if body := proto.FirstBytes(w, field); body != nil {
 			if inner := proto.FirstBytes(proto.Decode(body), 1); inner != nil {
 				path = proto.FirstString(proto.Decode(inner), 1)
@@ -380,22 +397,77 @@ func parseToolInputDelta(sm map[int][]proto.Field) (id, text string, ok bool) {
 // 参数容器内按「哪个字段被设置」区分工具类型，其值再套一层字段 1 才是真正的参数。
 // 例：2{12{1{1:"/a.py" 6:"内容"}}} 表示写文件。
 const (
-	toolRunTerminal = 1  // { 1: 命令, 5: 简称, 15: 说明 }
-	toolDeleteFile  = 3  // { 1: 路径 }
-	toolListFiles   = 4  // { 2: glob 模式 }
-	toolSearchFiles = 5  // { 1: 查询串, 4: 输出模式 }
-	toolReadFile    = 8  // { 1: 路径 }
-	toolWriteFile   = 12 // { 1: 路径, 6: 内容 }
-	toolTask        = 19 // { 1: 任务描述, 2: 任务提示词, 4: 模型 }
-	toolTodoWrite   = 23 // { 1: 描述, 2: 待办条目 }
-	toolFetchURL    = 37 // { 1: URL }
+	toolRunTerminal  = 1  // ShellArgs        { 1: 命令, 2: 工作目录, 15: 说明 }
+	toolDeleteFile   = 3  // DeleteArgs       { 1: 路径 }
+	toolGlob         = 4  // GlobToolArgs     { 1: 起始目录, 2: 文件名模式 }
+	toolSearchFiles  = 5  // GrepArgs         { 1: 正则, 2: 路径, 3: glob, 4: 输出模式 }
+	toolReadFile     = 8  // ReadArgs         { 1: 路径, 4: 起始行, 5: 行数 }
+	toolUpdateTodos  = 9  // UpdateTodosArgs  { 1: repeated TodoItem, 2: 是否合并 }
+	toolReadTodos    = 10 // ReadTodosArgs
+	toolWriteFile    = 12 // EditArgs         { 1: 路径, 6: 流式内容 }
+	toolListFiles    = 13 // LsArgs           { 1: 路径, 2: 忽略模式 }
+	toolReadLints    = 14 // ReadLintsArgs
+	toolSemSearch    = 16 // SemSearchArgs
+	toolWebSearch    = 18 // WebSearchArgs    { 1: 搜索词 }
+	toolTask         = 19 // TaskArgs         { 1: 描述, 2: 提示词, 4: 模型 }
+	toolAskQuestion  = 23 // AskQuestionArgs  { 1: 标题, 2: repeated 问题 }
+	toolFetch        = 24 // FetchArgs        { 1: URL }
+	toolGenerateImg  = 28 // GenerateImageArgs{ 1: 描述, 2: 文件路径 }
+	toolFetchURL     = 37 // WebFetchArgs     { 1: URL }
+	toolAwait        = 42 // AwaitArgs        { 1: 任务 id, 2: 等待毫秒, 3: 正则 }
+	toolSwitchMode   = 25 // SwitchModeArgs
+	toolCreatePlan   = 17 // CreatePlanArgs
+	toolMCP          = 15 // McpArgs
+	toolReportBug    = 45 // ReportBugArgs
+	toolSearchConvos = 69 // SearchConversationsArgs
 )
 
-// knownToolFields 用于识别「出现了工具调用，但我们还不认识」的情况。
-var knownToolFields = map[int]bool{
-	toolRunTerminal: true, toolDeleteFile: true, toolListFiles: true,
-	toolSearchFiles: true, toolReadFile: true, toolWriteFile: true,
-	toolTask: true, toolTodoWrite: true, toolFetchURL: true,
+// toolNames 是参数容器 agent.v1.ToolCall 的字段表，抄自 Cursor 客户端自带的
+// protobuf 描述（cursor-local-agent-runtime/dist/main.js），不是靠抓帧猜的。
+//
+// 覆盖全部字段而不只是我们会解析参数的那些：认不出参数没关系，
+// 但至少要能在日志与「未识别工具」页面里报出这个工具叫什么，
+// 而不是只给一个光秃秃的字段号。
+var toolNames = map[int]string{
+	1: "shell", 3: "delete", 4: "glob", 5: "grep", 8: "read",
+	9: "update_todos", 10: "read_todos", 12: "edit", 13: "ls",
+	14: "read_lints", 15: "mcp", 16: "sem_search", 17: "create_plan",
+	18: "web_search", 19: "task", 20: "list_mcp_resources",
+	21: "read_mcp_resource", 22: "apply_agent_diff", 23: "ask_question",
+	24: "fetch", 25: "switch_mode", 28: "generate_image", 29: "record_screen",
+	30: "computer_use", 31: "write_shell_stdin", 32: "reflect",
+	33: "setup_vm_environment", 34: "truncated", 35: "start_grind_execution",
+	36: "start_grind_planning", 37: "web_fetch", 38: "report_bugfix_results",
+	39: "ai_attribution", 40: "pr_management", 41: "mcp_auth", 42: "await",
+	43: "blame_by_file_path", 44: "get_mcp_tools", 45: "report_bug",
+	46: "set_active_branch", 48: "communicate_update", 49: "send_final_summary",
+	50: "update_pr_code_tour", 51: "replace_env", 52: "edit_pr_labels",
+	53: "record_ci_investigation_findings", 55: "send_message",
+	56: "fetch_cloud_agent_data", 58: "send_to_user", 61: "pi_read",
+	62: "pi_bash", 63: "pi_edit", 64: "pi_write", 65: "pi_grep",
+	66: "pi_find", 67: "pi_ls", 68: "connect_scm", 69: "search_conversations",
+	70: "create_goal", 71: "update_goal",
+}
+
+// toolKinds 把字段号映射到内部类型。「进行中」帧的参数还不完整，
+// 解析器那套「字段为空就返回 nil」的判定用不上，所以单列一张表。
+var toolKinds = map[int]NativeToolKind{
+	toolRunTerminal: ToolRunTerminal, toolDeleteFile: ToolDeleteFile,
+	toolGlob: ToolGlob, toolSearchFiles: ToolSearchFiles,
+	toolReadFile: ToolReadFile, toolUpdateTodos: ToolUpdateTodos,
+	toolWriteFile: ToolWriteFile, toolListFiles: ToolListFiles,
+	toolWebSearch: ToolWebSearch, toolTask: ToolTask,
+	toolAskQuestion: ToolAskQuestion, toolFetch: ToolFetchURL,
+	toolFetchURL: ToolFetchURL, toolAwait: ToolAwait,
+}
+
+// toolMetaFields 是参数容器里与具体工具无关的附带字段，
+// 扫描未识别工具时必须跳过，否则会把它们误报成工具调用。
+var toolMetaFields = map[int]bool{
+	54: true, // hook_additional_contexts
+	57: true, // tool_call_id
+	59: true, // started_at_ms
+	60: true, // completed_at_ms
 }
 
 // parseNativeToolCall 从「工具调用完成」帧里解出内置工具调用。
@@ -428,78 +500,163 @@ func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
 		return proto.Decode(inner)
 	}
 
-	if a := args(toolWriteFile); a != nil {
-		if path := proto.FirstString(a, 1); path != "" {
-			return &NativeToolCall{
-				Kind: ToolWriteFile, ID: id,
-				Path: path, Content: proto.FirstString(a, 6),
-			}
+	// 按字段号查表解析。早期是一串 if，字段号靠抓帧猜，出过两次错
+	// （4 当成 ls 其实是 glob、23 当成 todo 其实是 ask_question），
+	// 改成查表后加工具只需加一行，也不会再受判断顺序影响。
+	for field, parse := range toolParsers {
+		a := args(field)
+		if a == nil {
+			continue
 		}
-	}
-	if a := args(toolReadFile); a != nil {
-		if path := proto.FirstString(a, 1); path != "" {
-			return &NativeToolCall{Kind: ToolReadFile, ID: id, Path: path}
+		call := parse(a)
+		if call == nil {
+			continue
 		}
-	}
-	if a := args(toolRunTerminal); a != nil {
-		if cmd := proto.FirstString(a, 1); cmd != "" {
-			return &NativeToolCall{
-				Kind: ToolRunTerminal, ID: id,
-				Command: cmd, Description: proto.FirstString(a, 15),
-			}
-		}
-	}
-	if a := args(toolSearchFiles); a != nil {
-		if q := proto.FirstString(a, 1); q != "" {
-			return &NativeToolCall{Kind: ToolSearchFiles, ID: id, Pattern: q}
-		}
-	}
-	if a := args(toolTask); a != nil {
-		if prompt := proto.FirstString(a, 2); prompt != "" {
-			return &NativeToolCall{
-				Kind: ToolTask, ID: id,
-				Description: proto.FirstString(a, 1), Prompt: prompt,
-			}
-		}
-	}
-	if a := args(toolDeleteFile); a != nil {
-		if path := proto.FirstString(a, 1); path != "" {
-			return &NativeToolCall{Kind: ToolDeleteFile, ID: id, Path: path}
-		}
-	}
-	if a := args(toolListFiles); a != nil {
-		// 这个工具的模式放在子字段 2，与搜索不同
-		if pattern := firstNonEmpty(a, 2, 1); pattern != "" {
-			return &NativeToolCall{Kind: ToolListFiles, ID: id, Pattern: pattern}
-		}
-	}
-	if a := args(toolFetchURL); a != nil {
-		if url := proto.FirstString(a, 1); url != "" {
-			return &NativeToolCall{Kind: ToolFetchURL, ID: id, URL: url}
-		}
-	}
-	if a := args(toolTodoWrite); a != nil {
-		return &NativeToolCall{
-			Kind: ToolTodoWrite, ID: id,
-			Description: proto.FirstString(a, 1),
-		}
+		call.ID = id
+		call.Field = field
+		return call
 	}
 
-	// 走到这里说明上游用了我们还不认识的工具。必须报出来——直接丢弃会让
+	// 走到这里说明上游用了我们还不解析参数的工具。必须报出来——直接丢弃会让
 	// 客户端收不到任何调用，对话就那样断掉，且无从排查。
 	for field := range w {
-		if field == 57 || field == 59 || knownToolFields[field] {
+		if toolMetaFields[field] {
+			continue
+		}
+		if _, parsed := toolParsers[field]; parsed {
 			continue
 		}
 		if body := proto.FirstBytes(w, field); body != nil {
 			return &NativeToolCall{
 				Kind: ToolUnknown, ID: id, Field: field,
+				Name:        toolNames[field],
 				Description: firstStringDeep(body, 3),
 				Raw:         body,
 			}
 		}
 	}
 	return nil
+}
+
+// toolParsers 按字段号解析各工具的参数。
+// 只收录「知道参数长什么样、且还原出来对客户端有用」的工具；
+// 其余的走未识别分支，靠 toolNames 报出名字即可。
+var toolParsers = map[int]func(a map[int][]proto.Field) *NativeToolCall{
+	toolWriteFile: func(a map[int][]proto.Field) *NativeToolCall {
+		path := proto.FirstString(a, 1)
+		if path == "" {
+			return nil
+		}
+		return &NativeToolCall{Kind: ToolWriteFile, Path: path, Content: proto.FirstString(a, 6)}
+	},
+	toolReadFile: func(a map[int][]proto.Field) *NativeToolCall {
+		if path := proto.FirstString(a, 1); path != "" {
+			return &NativeToolCall{Kind: ToolReadFile, Path: path}
+		}
+		return nil
+	},
+	toolRunTerminal: func(a map[int][]proto.Field) *NativeToolCall {
+		cmd := proto.FirstString(a, 1)
+		if cmd == "" {
+			return nil
+		}
+		return &NativeToolCall{
+			Kind: ToolRunTerminal, Command: cmd,
+			Path: proto.FirstString(a, 2), Description: proto.FirstString(a, 15),
+		}
+	},
+	toolSearchFiles: func(a map[int][]proto.Field) *NativeToolCall {
+		if q := proto.FirstString(a, 1); q != "" {
+			return &NativeToolCall{Kind: ToolSearchFiles, Pattern: q, Path: proto.FirstString(a, 2)}
+		}
+		return nil
+	},
+	toolGlob: func(a map[int][]proto.Field) *NativeToolCall {
+		// GlobToolArgs 的模式在字段 2，字段 1 是可选的起始目录
+		if p := proto.FirstString(a, 2); p != "" {
+			return &NativeToolCall{Kind: ToolGlob, Pattern: p, Path: proto.FirstString(a, 1)}
+		}
+		return nil
+	},
+	toolListFiles: func(a map[int][]proto.Field) *NativeToolCall {
+		if path := proto.FirstString(a, 1); path != "" {
+			return &NativeToolCall{Kind: ToolListFiles, Path: path}
+		}
+		return nil
+	},
+	toolDeleteFile: func(a map[int][]proto.Field) *NativeToolCall {
+		if path := proto.FirstString(a, 1); path != "" {
+			return &NativeToolCall{Kind: ToolDeleteFile, Path: path}
+		}
+		return nil
+	},
+	toolTask: func(a map[int][]proto.Field) *NativeToolCall {
+		prompt := proto.FirstString(a, 2)
+		if prompt == "" {
+			return nil
+		}
+		return &NativeToolCall{Kind: ToolTask, Description: proto.FirstString(a, 1), Prompt: prompt}
+	},
+	toolWebSearch: func(a map[int][]proto.Field) *NativeToolCall {
+		if q := proto.FirstString(a, 1); q != "" {
+			return &NativeToolCall{Kind: ToolWebSearch, Pattern: q}
+		}
+		return nil
+	},
+	toolFetchURL: fetchParser,
+	toolFetch:    fetchParser,
+	toolUpdateTodos: func(a map[int][]proto.Field) *NativeToolCall {
+		items := parseTodoItems(a)
+		if len(items) == 0 {
+			return nil
+		}
+		return &NativeToolCall{Kind: ToolUpdateTodos, Todos: items, Description: items[0].Content}
+	},
+	toolAwait: func(a map[int][]proto.Field) *NativeToolCall {
+		// task_id 可以为空（等待任意任务），所以这个工具不靠字段非空来识别
+		return &NativeToolCall{Kind: ToolAwait, Description: proto.FirstString(a, 1)}
+	},
+	toolAskQuestion: func(a map[int][]proto.Field) *NativeToolCall {
+		return &NativeToolCall{Kind: ToolAskQuestion, Description: proto.FirstString(a, 1)}
+	},
+}
+
+func fetchParser(a map[int][]proto.Field) *NativeToolCall {
+	if url := proto.FirstString(a, 1); url != "" {
+		return &NativeToolCall{Kind: ToolFetchURL, URL: url}
+	}
+	return nil
+}
+
+// todoStatus 对应 agent.v1.TodoStatus 枚举。
+// 用规范英文名而不是中文：这个值可能要填进客户端声明的待办工具参数里，
+// 显示用的中文在渲染那一层再翻。
+var todoStatus = map[uint64]string{
+	1: "pending", 2: "in_progress", 3: "completed", 4: "cancelled",
+}
+
+// parseTodoItems 解析 UpdateTodosArgs.todos（repeated TodoItem）。
+// TodoItem { 1: id, 2: 内容, 3: 状态, 4: 创建时间, 5: 更新时间 }
+func parseTodoItems(a map[int][]proto.Field) []TodoItem {
+	var out []TodoItem
+	for _, f := range a[1] {
+		if f.WireType != 2 {
+			continue
+		}
+		item := proto.Decode(f.Bytes)
+		content := proto.FirstString(item, 2)
+		if content == "" {
+			continue
+		}
+		status := ""
+		if v, ok := item[3]; ok && len(v) > 0 {
+			status = todoStatus[v[0].Varint]
+		}
+		out = append(out, TodoItem{
+			ID: proto.FirstString(item, 1), Content: content, Status: status,
+		})
+	}
+	return out
 }
 
 // firstNonEmpty 依次尝试若干字段，返回第一个非空字符串。
@@ -560,6 +717,9 @@ type agentStreamState struct {
 	emitted map[string]bool
 	// model 仅用于给未识别工具的记录标注来源模型。
 	model string
+	// announced 记录「进行中」帧宣告过的调用；收到完成帧后由 emitted 抵消。
+	// 收尾时还剩下的，就是上游宣告了却没做完的工具。
+	announced map[string]NativeToolKind
 	// toolKind / toolPath 记录每次调用的工具类型与路径。
 	// 「进行中」帧先于参数片段到达，据此判断片段要不要转发。
 	toolKind map[string]NativeToolKind
@@ -622,7 +782,9 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				if s.toolKind == nil {
 					s.toolKind = map[string]NativeToolKind{}
 					s.toolPath = map[string]string{}
+					s.announced = map[string]NativeToolKind{}
 				}
+				s.announced[id] = kind
 				if kind != "" {
 					s.toolKind[id] = kind
 				}
@@ -652,9 +814,13 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				s.emitted[call.ID] = true
 				s.sawToolCall = true
 				if call.Kind == ToolUnknown {
-					log.Printf("[cursor] 未识别的上游工具：参数容器字段 %d（线索: %q）。"+
-						"详情已记录到管理界面「未识别工具」页。", call.Field, trunc(call.Description, 80))
-					toollog.Record(call.Field, s.model, call.ID,
+					name := call.Name
+					if name == "" {
+						name = "未知"
+					}
+					log.Printf("[cursor] 上游用了尚未支持的内置工具 %s（字段 %d，线索: %q）。"+
+						"详情已记录到管理界面「未识别工具」页。", name, call.Field, trunc(call.Description, 80))
+					toollog.Record(call.Field, call.Name, s.model, call.ID,
 						call.Description, describeDeep(call.Raw, 5), call.Raw)
 				}
 				send(StreamEvent{Kind: EventToolCall, Tool: call})

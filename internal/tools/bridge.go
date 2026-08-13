@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -23,20 +24,28 @@ const (
 	KindReadFile NativeKind = "read_file"
 	// KindRunTerminal 执行终端命令。
 	KindRunTerminal NativeKind = "run_terminal"
-	// KindSearchFiles 按 glob 模式搜索文件。
+	// KindSearchFiles 按内容正则搜索（上游叫 grep）。
 	KindSearchFiles NativeKind = "search_files"
+	// KindGlob 按文件名模式查找文件。
+	KindGlob NativeKind = "glob"
+	// KindWebSearch 联网搜索。
+	KindWebSearch NativeKind = "web_search"
+	// KindAwait 等待后台任务。
+	KindAwait NativeKind = "await"
+	// KindAskQuestion 向用户提问。
+	KindAskQuestion NativeKind = "ask_question"
 	// KindWriteFile 写入文件。
 	KindWriteFile NativeKind = "write_file"
 	// KindTask 派发子 agent。
 	KindTask NativeKind = "task"
 	// KindDeleteFile 删除文件。
 	KindDeleteFile NativeKind = "delete_file"
-	// KindListFiles 按 glob 列出文件。
+	// KindListFiles 列出目录内容（上游叫 ls）。
 	KindListFiles NativeKind = "list_files"
 	// KindFetchURL 抓取网页。
 	KindFetchURL NativeKind = "fetch_url"
-	// KindTodoWrite 记录待办清单。
-	KindTodoWrite NativeKind = "todo_write"
+	// KindUpdateTodos 更新待办清单。
+	KindUpdateTodos NativeKind = "update_todos"
 	// KindUnknown 尚未识别的上游工具。
 	KindUnknown NativeKind = "unknown"
 )
@@ -53,6 +62,17 @@ type Native struct {
 	URL         string
 	Description string
 	Field       int
+	// Name 是上游给这个工具的规范名，未识别时用于提示。
+	Name string
+	// Todos 是待办清单条目。
+	Todos []TodoItem
+}
+
+// TodoItem 是待办清单里的一条。
+type TodoItem struct {
+	ID      string
+	Content string
+	Status  string
 }
 
 // 各类内置工具在客户端侧的候选名称，按优先级排列。
@@ -67,7 +87,13 @@ var candidateNames = map[NativeKind][]string{
 		"terminal", "exec", "run", "command",
 	},
 	KindSearchFiles: {
-		"glob", "file_search", "find_files", "search_files", "grep", "list", "ls",
+		"grep", "search", "grep_search", "ripgrep", "search_files", "codebase_search",
+	},
+	KindGlob: {
+		"glob", "file_search", "find_files", "find", "fuzzy_file_search",
+	},
+	KindWebSearch: {
+		"web_search", "websearch", "search_web", "google", "bing", "brave_search",
 	},
 	KindWriteFile: {
 		"write", "write_file", "create_file", "edit", "str_replace_editor", "apply_patch",
@@ -79,13 +105,13 @@ var candidateNames = map[NativeKind][]string{
 		"delete", "delete_file", "remove", "rm", "removefile",
 	},
 	KindListFiles: {
-		"glob", "list", "ls", "list_dir", "list_files", "find_files", "file_search",
+		"ls", "list_dir", "list_files", "list_directory", "list", "dir",
 	},
 	KindFetchURL: {
 		"webfetch", "web_fetch", "fetch", "read_url", "url_fetch", "browse", "http_get",
 	},
-	KindTodoWrite: {
-		"todowrite", "todo_write", "todos", "task_list", "update_plan",
+	KindUpdateTodos: {
+		"todowrite", "todo_write", "todos", "task_list", "update_plan", "update_todos",
 	},
 }
 
@@ -93,31 +119,67 @@ var candidateNames = map[NativeKind][]string{
 var candidateParams = map[NativeKind][]string{
 	KindReadFile:    {"filePath", "file_path", "path", "target_file", "filename", "file"},
 	KindRunTerminal: {"command", "cmd", "script", "shell_command"},
-	KindSearchFiles: {"pattern", "glob", "query", "globPattern", "path"},
+	KindSearchFiles: {"pattern", "query", "regex", "search_term", "q"},
+	KindGlob:        {"pattern", "glob", "globPattern", "query", "path"},
+	KindWebSearch:   {"query", "search_term", "q", "search", "keywords"},
 	KindWriteFile:   {"filePath", "file_path", "path", "target_file", "filename", "file"},
 	KindTask:        {"prompt", "task", "instructions", "input", "message"},
 	KindDeleteFile:  {"filePath", "file_path", "path", "target_file", "filename", "file"},
-	KindListFiles:   {"pattern", "glob", "globPattern", "path", "directory", "dir"},
+	KindListFiles:   {"path", "directory", "dir", "target_directory", "relative_workspace_path"},
 	KindFetchURL:    {"url", "uri", "link", "address"},
+	KindUpdateTodos: {"todos", "items", "tasks", "todo_list", "plan"},
+}
+
+// todoCall 把待办清单合成成客户端声明的待办工具调用。
+// 这类工具的参数是对象数组，走不了通用的「单值填一个属性」那套。
+func todoCall(n Native, def Definition) (Call, bool) {
+	items := make([]map[string]any, 0, len(n.Todos))
+	for i, t := range n.Todos {
+		id := t.ID
+		if id == "" {
+			id = strconv.Itoa(i + 1)
+		}
+		items = append(items, map[string]any{
+			"id": id, "content": t.Content, "status": t.Status,
+		})
+	}
+
+	key := "todos"
+	if k, ok := matchParam(KindUpdateTodos, def); ok {
+		key = k
+	}
+	raw, err := json.Marshal(map[string]any{key: items})
+	if err != nil {
+		return Call{}, false
+	}
+	id := n.ID
+	if id == "" {
+		id = NewCallID()
+	}
+	return Call{ID: id, Name: def.Name, Arguments: string(raw)}, true
 }
 
 // MapNative 把一次上游内置调用映射成客户端声明的工具调用。
 // 找不到合适的客户端工具时返回 false，调用方应回退到文本描述。
 func MapNative(n Native, defs []Definition) (Call, bool) {
-	// 待办与未知工具没有稳妥的参数可合成，交给文本兜底
-	if n.Kind == KindUnknown || n.Kind == KindTodoWrite {
+	// 这几类没有稳妥的参数可合成（或本就是给用户看的），交给文本兜底
+	if n.Kind == KindUnknown || n.Kind == KindAwait || n.Kind == KindAskQuestion {
 		return Call{}, false
 	}
 	def, ok := matchTool(n.Kind, defs)
 	if !ok {
 		return Call{}, false
 	}
+	// 待办清单是数组参数，与其它工具的单值参数不同，单独合成
+	if n.Kind == KindUpdateTodos {
+		return todoCall(n, def)
+	}
 
 	var value string
 	switch n.Kind {
 	case KindRunTerminal:
 		value = n.Command
-	case KindSearchFiles, KindListFiles:
+	case KindSearchFiles, KindGlob, KindWebSearch:
 		value = n.Pattern
 	case KindTask:
 		value = n.Prompt
@@ -297,7 +359,11 @@ func DescribeNative(n Native) string {
 	case KindRunTerminal:
 		return "（上游请求执行命令：" + n.Command + "）"
 	case KindSearchFiles:
-		return "（上游请求搜索文件：" + n.Pattern + "）"
+		return "（上游请求按内容搜索：" + n.Pattern + "）"
+	case KindGlob:
+		return "（上游请求按文件名查找：" + n.Pattern + "）"
+	case KindWebSearch:
+		return "（上游请求联网搜索：" + n.Pattern + "）"
 	case KindWriteFile:
 		return "（上游请求写入文件：" + n.Path + "）"
 	case KindTask:
@@ -305,14 +371,46 @@ func DescribeNative(n Native) string {
 	case KindDeleteFile:
 		return "（上游请求删除文件：" + n.Path + "）"
 	case KindListFiles:
-		return "（上游请求列出文件：" + n.Pattern + "）"
+		return "（上游请求列出目录：" + n.Path + "）"
 	case KindFetchURL:
 		return "（上游请求抓取网页：" + n.URL + "）"
-	case KindTodoWrite:
-		return "（上游更新了待办清单：" + n.Description + "）"
+	case KindAskQuestion:
+		return "（上游想向你提问：" + n.Description + "）"
+	case KindAwait:
+		return "（上游在等待后台任务完成）"
+	case KindUpdateTodos:
+		return renderTodos(n.Todos)
 	case KindUnknown:
+		if n.Name != "" {
+			return fmt.Sprintf("（上游用了本代理尚未支持的内置工具 %s（#%d），已跳过）", n.Name, n.Field)
+		}
 		return fmt.Sprintf("（上游请求了本代理尚未支持的工具 #%d，已跳过。"+
 			"如需支持请带上此编号反馈）", n.Field)
 	}
 	return ""
+}
+
+// todoLabel 把待办状态翻成显示用的中文。
+var todoLabel = map[string]string{
+	"pending": "待办", "in_progress": "进行中",
+	"completed": "已完成", "cancelled": "已取消",
+}
+
+// renderTodos 把待办清单渲染成一段可读文本。
+// 客户端多半没有对应的工具可执行，但把清单显示出来对用户是有用的进度信息。
+func renderTodos(items []TodoItem) string {
+	if len(items) == 0 {
+		return "（上游更新了待办清单）"
+	}
+	var b strings.Builder
+	b.WriteString("（上游更新了待办清单）\n")
+	for _, it := range items {
+		b.WriteString("- ")
+		if label := todoLabel[it.Status]; label != "" {
+			b.WriteString("[" + label + "] ")
+		}
+		b.WriteString(it.Content)
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }

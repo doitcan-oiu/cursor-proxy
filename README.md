@@ -102,28 +102,46 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 下发给客户端执行；这些调用原先被整个忽略，表现就是「模型说要做某事，然后对话断了」。
 现在会解析出来并按名称与 JSON Schema 映射到客户端声明的对应工具。已覆盖的内置工具：
 
-| 上游工具（参数容器字段号） | 映射到客户端的 |
+字段号与参数结构**抄自 Cursor 客户端自带的 protobuf 描述**
+（`/usr/share/cursor/resources/app/extensions/cursor-local-agent-runtime/dist/main.js`
+里的 `agent.v1.ToolCall`），不是靠抓帧猜的——早期靠猜错过两次
+（字段 4 当成 ls 其实是 glob，字段 23 当成待办其实是向用户提问）。
+
+| 上游工具（`agent.v1.ToolCall` 字段号） | 映射到客户端的 |
 | --- | --- |
-| 执行终端命令 (1) | `bash` / `shell` / `run_terminal_cmd` … |
-| 删除文件 (3) | `delete` / `rm` / `remove` … |
-| 列出文件 (4) | `glob` / `list` / `ls` / `file_search` … |
-| 内容搜索 (5) | `grep` / `glob` / `find_files` … |
-| 读文件 (8) | `read` / `view_file` / `cat` … |
-| 写文件 (12) | `write` / `edit` / `create_file` … |
-| 派发子 agent (19) | `task` / `agent` / `subagent` … |
-| 待办清单 (23) | 文本说明（参数结构复杂，不合成调用） |
-| 抓取网页 (37) | `webfetch` / `fetch` / `read_url` … |
+| `shell` (1) | `bash` / `shell` / `run_terminal_cmd` … |
+| `delete` (3) | `delete` / `rm` / `remove` … |
+| `glob` (4) | `glob` / `file_search` / `find_files` … |
+| `grep` (5) | `grep` / `search` / `ripgrep` … |
+| `read` (8) | `read` / `view_file` / `cat` … |
+| `update_todos` (9) | `TodoWrite` / `todos` / `update_plan` …（合成 todos 数组） |
+| `edit` (12) | `write` / `edit` / `create_file` … |
+| `ls` (13) | `ls` / `list_dir` / `list_directory` … |
+| `web_search` (18) | `web_search` / `search_web` … |
+| `task` (19) | `task` / `agent` / `subagent` … |
+| `ask_question` (23) | 文本说明（本就是给用户看的） |
+| `fetch` (24) / `web_fetch` (37) | `webfetch` / `fetch` / `read_url` … |
+| `await` (42) | 文本说明 |
+
+其余 40 多个内置工具（`generate_image`、`computer_use`、`pi_*` 系列等）
+只登记了规范名，暂不解析参数；真被用到时客户端会收到一句带工具名的说明。
 
 文本协议作为补充，覆盖上游没有内置对应物的自定义工具。
 用 `NATIVE_TOOL_BRIDGE=off` 可关闭桥接。
 
 **遇到没映射的工具怎么办**：未识别的工具不会被静默丢弃。管理界面有一个
-**「未识别工具」页面**（侧栏带红色角标提示数量），记录每个未知工具的字段号、
+**「未识别工具」页面**（侧栏带红色角标提示数量），记录工具的规范名、字段号、
 触发它的模型、参数结构与原始字节，可一键复制或导出 JSON。同时服务端日志也会打印一行提示，
 客户端则收到一句说明文本而不是空回复。
 
-拿到这份记录就能直接补映射：把字段号与参数结构填进 `internal/cursor/agent.go`
-的工具表和 `internal/tools/bridge.go` 的映射表即可，不必再自己抓帧。
+补映射时把字段号与参数结构填进 `internal/cursor/agent.go` 的 `toolParsers`
+和 `internal/tools/bridge.go` 的 `candidateNames` 即可，各加一行。
+
+**工具宣告了却没做完**：上游偶尔只发一个「进行中」帧宣告要用某工具，
+然后既不给参数也不发完成帧（实测 `web_search` 就是这样，参数长度 0）。
+这种情况下客户端只会收到模型那句「我这就去搜索…」然后流正常结束，
+看起来像模型自己说完了。代理会在收尾时补一句说明指出是哪个工具没做完，
+不让它静默过去。
 
 实测（OpenCode 完成「创建文件 → 运行 → 汇报输出」）：
 

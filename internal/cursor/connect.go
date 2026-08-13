@@ -28,6 +28,13 @@ const (
 	EventToolInputDelta
 )
 
+// TodoItem 是待办清单里的一条。
+type TodoItem struct {
+	ID      string
+	Content string
+	Status  string
+}
+
 // NativeToolKind 是上游内置工具的类型。
 type NativeToolKind string
 
@@ -36,20 +43,28 @@ const (
 	ToolReadFile NativeToolKind = "read_file"
 	// ToolRunTerminal 执行终端命令，参数为命令行。
 	ToolRunTerminal NativeToolKind = "run_terminal"
-	// ToolSearchFiles 按 glob 模式搜索文件。
+	// ToolSearchFiles 按内容正则搜索（上游叫 grep）。
 	ToolSearchFiles NativeToolKind = "search_files"
+	// ToolGlob 按文件名模式查找文件（上游叫 glob）。
+	ToolGlob NativeToolKind = "glob"
+	// ToolWebSearch 联网搜索。
+	ToolWebSearch NativeToolKind = "web_search"
+	// ToolUpdateTodos 更新待办清单。
+	ToolUpdateTodos NativeToolKind = "update_todos"
+	// ToolAwait 等待后台任务。
+	ToolAwait NativeToolKind = "await"
+	// ToolAskQuestion 向用户提问。
+	ToolAskQuestion NativeToolKind = "ask_question"
 	// ToolWriteFile 写入文件。
 	ToolWriteFile NativeToolKind = "write_file"
 	// ToolTask 派发一个子 agent 去完成子任务。
 	ToolTask NativeToolKind = "task"
 	// ToolDeleteFile 删除文件。
 	ToolDeleteFile NativeToolKind = "delete_file"
-	// ToolListFiles 按 glob 列出文件。
+	// ToolListFiles 列出目录内容（上游叫 ls）。
 	ToolListFiles NativeToolKind = "list_files"
 	// ToolFetchURL 抓取网页。
 	ToolFetchURL NativeToolKind = "fetch_url"
-	// ToolTodoWrite 记录待办清单。
-	ToolTodoWrite NativeToolKind = "todo_write"
 	// ToolUnknown 是尚未识别的上游工具。保留它是为了不让对话静默中断——
 	// 未映射的工具会以说明文本告知客户端，并在日志里打出字段号便于补齐。
 	ToolUnknown NativeToolKind = "unknown"
@@ -69,6 +84,10 @@ type NativeToolCall struct {
 	Prompt      string // ToolTask
 	URL         string // ToolFetchURL
 	Description string
+	// Todos 是 ToolUpdateTodos 的清单条目。
+	Todos []TodoItem
+	// Name 是上游给这个工具的规范名，未识别时也能报出来。
+	Name string
 	// Field 是未识别工具在参数容器里的字段号，用于日志排查与后续补齐。
 	Field int
 	// Raw 是未识别工具的原始参数字节，留档供补映射时复核。

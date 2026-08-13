@@ -286,6 +286,46 @@ agent.v1.UserMessage.4 = mode
 `finish_reason=length`（Anthropic 侧 `stop_reason=max_tokens`）并打一行日志，
 调试台会追加一句说明。截断可以接受，静默截断不行。
 
+### ~~P1：内置工具的字段号靠抓帧猜，错了两个~~（已在 Go 版修复）
+早期是抓帧观察结构再猜工具类型，一串 `if` 按顺序判断。用户导出的「未识别工具」
+记录暴露了两个错误：字段 4 被当成「列出文件」（实际是 `glob`，`ls` 在 13），
+字段 23 被当成「待办清单」（实际是 `ask_question`，`update_todos` 在 9）。
+猜错不会报错，只会让工具被悄悄归错类。
+
+改为从 Cursor 客户端自带的 protobuf 描述里抄
+（`cursor-local-agent-runtime/dist/main.js` 的 `agent.v1.ToolCall`），
+一次拿到全部 60 多个字段的规范名与参数结构，例如：
+
+```
+9  update_todos  UpdateTodosArgs { 1: repeated TodoItem, 2: merge }
+                 TodoItem { 1: id, 2: content, 3: status, 4/5: 时间戳 }
+4  glob          GlobToolArgs { 1: target_directory, 2: glob_pattern }
+13 ls            LsArgs { 1: path, 2: ignore }
+18 web_search    WebSearchArgs { 1: search_term }
+42 await         AwaitArgs { 1: task_id, 2: block_until_ms, 3: regex }
+```
+
+同时把那串 `if` 改成查表（`toolParsers`），加工具只需加一行，也不再受判断顺序影响；
+未解析参数的工具也登记了规范名，日志与「未识别工具」页面直接显示
+`record_screen` 而不是光秃秃的 `#29`。
+
+cursor 层与 tools 层的类型值本就是同一批字符串，两个手写的 switch 转换函数
+（每加一个工具都要记得同步，漏了就会被归成「读文件」）也一并删掉了。
+
+### ~~P1：工具「宣告了却没做完」时对话静默结束~~（已在 Go 版修复）
+上游偶尔只发一个「进行中」帧宣告要用某工具，然后既不发参数也不发完成帧。
+实测 `web_search` 稳定复现：
+
+```
+1{7{1="toolu_…" 2{18[0B] …}}}   ← 宣告要用 web_search，参数长度 0
+1{7{1="toolu_…" 2{18[0B] …}}}   ← 又试一次，还是空
+4{…}                            ← 直接回写会话记录，本轮结束
+```
+
+客户端只收到模型那句「I'll search for the latest Go version」然后流正常结束，
+`finish_reason=stop`——又是一次静默失败。现在收尾时会检查「宣告过但没完成」的调用，
+补一句说明指出是哪个工具、为什么没做完。
+
 ### P2：`checkAllAccounts` / 批量验号会打真实计费请求
 `get-current-period-usage` 和 `full_stripe_profile` 每次验号都会请求 Cursor 官方接口。账号多时
 一轮全量验号是几十上百个外部请求，且无缓存。建议对 plan/usage 结果做短 TTL 缓存（如 5 分钟），

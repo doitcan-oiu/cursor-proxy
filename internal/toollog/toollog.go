@@ -17,6 +17,9 @@ type Entry struct {
 	Time int64 `json:"time"`
 	// Field 是参数容器里的字段号，补映射时按它区分工具。
 	Field int `json:"field"`
+	// Name 是上游给这个工具的规范名（取自 Cursor 客户端自带的描述）。
+	// 光有字段号的话，补映射时还得再去查一次描述文件。
+	Name string `json:"name,omitempty"`
 	// Model 是触发这次调用的模型，不同模型可用的工具集可能不同。
 	Model  string `json:"model"`
 	CallID string `json:"callId,omitempty"`
@@ -40,7 +43,7 @@ var (
 )
 
 // Record 记录一次未识别的工具调用。
-func Record(field int, model, callID, hint, structure string, raw []byte) {
+func Record(field int, name, model, callID, hint, structure string, raw []byte) {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -50,6 +53,7 @@ func Record(field int, model, callID, hint, structure string, raw []byte) {
 		if buffer[i].Field == field {
 			buffer[i].Time = time.Now().UnixMilli()
 			buffer[i].Model = model
+			buffer[i].Name = name
 			buffer[i].Hint = hint
 			buffer[i].Structure = structure
 			buffer[i].RawBase64 = base64.StdEncoding.EncodeToString(raw)
@@ -63,6 +67,7 @@ func Record(field int, model, callID, hint, structure string, raw []byte) {
 		Field:     field,
 		Model:     model,
 		CallID:    callID,
+		Name:      name,
 		Hint:      hint,
 		Structure: structure,
 		RawBase64: base64.StdEncoding.EncodeToString(raw),

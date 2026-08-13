@@ -118,6 +118,7 @@ export interface UnknownTool {
   id: number
   time: number
   field: number
+  name?: string
   model: string
   callId?: string
   hint?: string

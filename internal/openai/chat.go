@@ -472,35 +472,23 @@ func toNativePtr(c *cursor.NativeToolCall) *tools.Native {
 }
 
 // toNative 把 cursor 层的内置调用转成 tools 层的形态（两层不互相依赖）。
+//
+// 两边的类型值是同一批字符串（都取自上游的规范名），所以直接转换即可。
+// 早期这里是一个手写的 switch，每加一个工具就得记得同步改，漏改的表现是
+// 工具被悄悄归成「读文件」——不如让编译器和命名约定来保证一致。
 func toNative(c *cursor.NativeToolCall) tools.Native {
 	if c == nil {
 		return tools.Native{}
 	}
-	kind := tools.KindReadFile
-	switch c.Kind {
-	case cursor.ToolRunTerminal:
-		kind = tools.KindRunTerminal
-	case cursor.ToolSearchFiles:
-		kind = tools.KindSearchFiles
-	case cursor.ToolWriteFile:
-		kind = tools.KindWriteFile
-	case cursor.ToolTask:
-		kind = tools.KindTask
-	case cursor.ToolDeleteFile:
-		kind = tools.KindDeleteFile
-	case cursor.ToolListFiles:
-		kind = tools.KindListFiles
-	case cursor.ToolFetchURL:
-		kind = tools.KindFetchURL
-	case cursor.ToolTodoWrite:
-		kind = tools.KindTodoWrite
-	case cursor.ToolUnknown:
-		kind = tools.KindUnknown
+	todos := make([]tools.TodoItem, 0, len(c.Todos))
+	for _, t := range c.Todos {
+		todos = append(todos, tools.TodoItem{ID: t.ID, Content: t.Content, Status: t.Status})
 	}
 	return tools.Native{
-		ID: c.ID, Kind: kind, Path: c.Path, Command: c.Command,
+		ID: c.ID, Kind: tools.NativeKind(c.Kind), Path: c.Path, Command: c.Command,
 		Pattern: c.Pattern, Content: c.Content, Prompt: c.Prompt,
 		URL: c.URL, Description: c.Description, Field: c.Field,
+		Name: c.Name, Todos: todos,
 	}
 }
 
