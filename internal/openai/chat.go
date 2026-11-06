@@ -174,15 +174,6 @@ func (b chatBody) toolChoice() tools.Choice {
 	return tools.Choice{Mode: "auto"}
 }
 
-// usagePayload 组装 OpenAI 风格的 usage。token 数为估算值，见 internal/tokenize。
-func usagePayload(promptTokens, completionTokens int) map[string]any {
-	return map[string]any{
-		"prompt_tokens":     promptTokens,
-		"completion_tokens": completionTokens,
-		"total_tokens":      promptTokens + completionTokens,
-	}
-}
-
 func sseChunk(id, model string, delta map[string]any, finish any) string {
 	payload := map[string]any{
 		"id":      id,

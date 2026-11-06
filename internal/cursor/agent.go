@@ -104,7 +104,7 @@ func GetUsableModels(token, proxyURL string) ([]AgentModel, error) {
 	return out, nil
 }
 
-func parseErrorFrame(utf string) string {
+func (s *agentStreamState) emitErrorFrame(payload string, send func(StreamEvent) bool) {
 	var j struct {
 		Error *struct {
 			Code    string `json:"code"`
@@ -119,24 +119,30 @@ func parseErrorFrame(utf string) string {
 			} `json:"details"`
 		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(utf), &j) != nil || j.Error == nil {
-		return ""
+	if json.Unmarshal([]byte(payload), &j) != nil || j.Error == nil {
+		return
 	}
+	// 已产出正文或完整工具调用并回写了会话记录，尾部取消只表示上游关闭流。
+	if j.Error.Code == "canceled" && s.turnComplete && (s.gotContent || s.sawToolCall) {
+		return
+	}
+	message := j.Error.Code
 	if len(j.Error.Details) > 0 {
 		d := j.Error.Details[0].Debug
 		switch {
 		case d.Details.Detail != "":
-			return d.Details.Detail
+			message = d.Details.Detail
 		case d.Details.Title != "":
-			return d.Details.Title
+			message = d.Details.Title
 		case d.Error != "":
-			return d.Error
+			message = d.Error
 		}
 	}
-	if j.Error.Code != "" {
-		return j.Error.Code
+	if message == "" {
+		message = snippet([]byte(payload), 200)
 	}
-	return snippet([]byte(utf), 200)
+	s.errored = true
+	send(StreamEvent{Kind: EventError, Message: message})
 }
 
 // AgentStream 是一个可取消的对话流。
@@ -805,15 +811,8 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			payload = raw
 		}
 		if flag&0x02 != 0 {
-			// Connect 协议的 end-of-stream 帧。agentn.api5 目前不发这个，
-			// 但按协议处理，换端点或上游改行为时都能立刻收尾。
-			utf := strings.TrimSpace(string(payload))
-			if utf != "" {
-				if e := parseErrorFrame(utf); e != "" {
-					s.errored = true
-					send(StreamEvent{Kind: EventError, Message: e})
-				}
-			}
+			// Connect 协议的 end-of-stream 帧，收到后立刻收尾。
+			s.emitErrorFrame(strings.TrimSpace(string(payload)), send)
 			*buffer = b[pos:]
 			return true
 		}
@@ -831,6 +830,8 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			// 「进行中」帧先到：记下这次调用的工具类型与路径，
 			// 后续的参数片段才知道该不该转发。
 			if id, kind, path, field, ok := parseToolProgress(smFields); ok {
+				// 回写后又有工具活动，和收到新正文一样撤回结束判定。
+				s.turnComplete = false
 				if s.toolKind == nil {
 					s.toolKind = map[string]NativeToolKind{}
 					s.toolPath = map[string]string{}
@@ -855,6 +856,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			// 参数流式片段
 			if id, text, ok := parseToolInputDelta(smFields); ok {
 				if text != "" {
+					s.turnComplete = false
 					send(StreamEvent{
 						Kind: EventToolInputDelta,
 						Text: text,
@@ -866,6 +868,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 
 			// 内置工具调用：参数完整的「调用完成」帧
 			if call := parseNativeToolCall(smFields); call != nil && !s.emitted[call.ID] {
+				s.turnComplete = false
 				if s.emitted == nil {
 					s.emitted = map[string]bool{}
 				}
@@ -902,10 +905,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 
 		utf := string(payload)
 		if strings.Contains(utf, `"error"`) {
-			if e := parseErrorFrame(utf); e != "" {
-				s.errored = true
-				send(StreamEvent{Kind: EventError, Message: e})
-			}
+			s.emitErrorFrame(utf, send)
 			continue
 		}
 

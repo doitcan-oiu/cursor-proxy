@@ -319,7 +319,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			"message": map[string]any{
 				"id": id, "type": "message", "role": "assistant", "model": model,
 				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-				"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
+				"usage": anthropicUsage(inputTokens, 0),
 			},
 		})
 		send("ping", map[string]any{"type": "ping"})
@@ -417,7 +417,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		send("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
+			"usage": anthropicUsage(inputTokens, outputTokens),
 		})
 		send("message_stop", map[string]any{"type": "message_stop"})
 		tl.done(fmt.Sprintf(" :: 输入 %d tok / 输出 %d tok / %d 字",
@@ -503,7 +503,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		"content":       blocks,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage":         map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens},
+		"usage":         anthropicUsage(inputTokens, outputTokens),
 	})
 }
 

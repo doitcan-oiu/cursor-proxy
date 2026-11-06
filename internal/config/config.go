@@ -83,6 +83,9 @@ type Config struct {
 	// "bpe"（默认）用内嵌词表精确分词；"estimate" 关闭分词器改用启发式，省约 7MB 内存。
 	TokenizerMode string
 
+	// SimulatedCachePercent 是 usage 中模拟为缓存读取的输入 token 百分比。
+	SimulatedCachePercent int
+
 	Antiban Antiban
 }
 
@@ -136,6 +139,10 @@ func Get() *Config {
 		}
 
 		token, generated := resolveAdminToken(dataDir)
+		cachePercent := envInt("SIMULATED_CACHE_PERCENT", 0)
+		if cachePercent < 0 || cachePercent > 100 {
+			cachePercent = 0
+		}
 
 		cached = &Config{
 			ProjectRoot:         root,
@@ -161,6 +168,8 @@ func Get() *Config {
 			IMAPPort:            envInt("IMAP_PORT", 993),
 			AskMode:             envStr("ASK_MODE", "off") == "on",
 			TokenizerMode:       envStr("TOKENIZER", "bpe"),
+
+			SimulatedCachePercent: cachePercent,
 			Antiban: Antiban{
 				MinIntervalMs:          envInt("ACCOUNT_MIN_INTERVAL_MS", 0),
 				MaxConcurrency:         envInt("ACCOUNT_MAX_CONCURRENCY", 64),

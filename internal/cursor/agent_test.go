@@ -498,6 +498,51 @@ func TestStreamEndsImmediatelyOnEndOfStreamFrame(t *testing.T) {
 	}
 }
 
+func TestStreamCancellationAfterWriteback(t *testing.T) {
+	completed := func() []byte { return append(contentFrame("hi"), conversationFrame(4)...) }
+	args := proto.NewWriter()
+	args.Str(1, "/tmp/a.txt")
+	toolCall := toolCallFrame("call", toolReadFile, args)
+
+	for _, tc := range []struct {
+		name  string
+		data  []byte
+		flag  byte
+		code  string
+		final StreamEventKind
+	}{
+		{"completed response", completed(), 0x02, "canceled", EventEnd},
+		{"completed response with a separate error frame", completed(), 0x00, "canceled", EventEnd},
+		{"completed tool-only response", append(toolCall, conversationFrame(4)...), 0x02, "canceled", EventEnd},
+		{"partial response", contentFrame("hi"), 0x02, "canceled", EventError},
+		{"response continued after writeback", append(completed(), contentFrame(" again")...), 0x02, "canceled", EventError},
+		{"tool announced after writeback", append(completed(), progressFrame("call", toolWriteFile, "/tmp/a.txt")...), 0x02, "canceled", EventError},
+		{"tool input continued after writeback", append(completed(), inputDeltaFrame("call", "text")...), 0x02, "canceled", EventError},
+		{"tool call after writeback", append(completed(), toolCall...), 0x02, "canceled", EventError},
+		{"other upstream error", completed(), 0x02, "internal", EventError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := append(tc.data, frame(tc.flag, []byte(`{"error":{"code":"`+tc.code+`"}}`))...)
+			body := io.NopCloser(readerOf(data))
+			events := make(chan StreamEvent, 8)
+			pumpAgentStream(context.Background(), body, events, "test-model")
+
+			var terminal []StreamEvent
+			for ev := range events {
+				if ev.Kind == EventError || ev.Kind == EventEnd {
+					terminal = append(terminal, ev)
+				}
+			}
+			if len(terminal) != 1 || terminal[0].Kind != tc.final {
+				t.Fatalf("terminal events = %+v, want one event of kind %v", terminal, tc.final)
+			}
+			if tc.final == EventError && terminal[0].Message != tc.code {
+				t.Fatalf("error message = %q, want %q", terminal[0].Message, tc.code)
+			}
+		})
+	}
+}
+
 // 上游直接关闭连接（不发 trailer）时也应立刻收尾。
 func TestStreamEndsOnUpstreamClose(t *testing.T) {
 	body := io.NopCloser(readerOf(contentFrame("hi")))

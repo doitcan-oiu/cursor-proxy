@@ -11,6 +11,9 @@ cp .env.example .env        # 按需修改；ADMIN_TOKEN 留空会自动生成
 
 make build                  # 构建管理界面 + 二进制
 # 没装 make 就用：./build.sh
+set -a
+. ./.env                    # 将配置导出到服务进程的环境
+set +a
 ./cursor-proxy
 ```
 
@@ -375,6 +378,25 @@ Cursor 上游不返回 token 用量，所以这里由本地计算，见 `interna
   二进制从 ~19MB 降回 ~8MB。
 
 OpenAI 流式需要 usage 时按规范传 `stream_options: {"include_usage": true}`。
+
+### 模拟缓存读取
+
+启动时设置 `SIMULATED_CACHE_PERCENT`，可在 OpenAI 和 Anthropic 的 `usage` 中模拟缓存读取。修改后重启服务生效。
+取值为 `0` 到 `100` 的整数，默认 `0`。超出范围或格式无效时按 `0` 处理。
+例如设置为 `80`，每个响应将输入 token 数的 80% 向下取整后计为模拟缓存读取。
+模拟比例只用于响应中的用量字段。每次请求照常转发给 Cursor，实际费用仍以 Cursor 的用量为准。
+
+```bash
+SIMULATED_CACHE_PERCENT=80 ./cursor-proxy
+```
+
+PowerShell 下构建并启动：
+
+```powershell
+go build -o cursor-proxy.exe ./cmd/server
+$env:SIMULATED_CACHE_PERCENT = '80'
+.\cursor-proxy.exe
+```
 
 ## 其它路由
 
