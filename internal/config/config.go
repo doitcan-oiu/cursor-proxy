@@ -46,8 +46,7 @@ type Config struct {
 
 	AgentClientVersion string
 	AgentIdleMs        int
-	// AgentFinishIdleMs 是上游回写会话记录（本轮生成结束）之后的收尾等待。
-	// 上游永不关闭连接、只每 10s 发心跳，靠这个短窗口收残余帧后立刻结束。
+	// AgentFinishIdleMs 是收到上游轮次结束事件后等待最终帧的短窗口。
 	AgentFinishIdleMs int
 	// AgentHardCapMs 是单轮对话的时长兜底，防的是「一直吐、永远不停」的失控流。
 	// 卡住的流由 AgentIdleMs 负责，所以这里给得很宽：早期默认 180s，

@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -172,36 +173,78 @@ var hardCapFor = func() time.Duration {
 // mode 决定上游按 agent 还是纯问答行事，见 AskMode / AgentMode。
 func StreamAgent(messages []types.Message, modelID, token, proxyURL string, mode proto.Mode) (*AgentStream, error) {
 	bearer := auth.ExtractBearer(token)
-	body := connectFrame(proto.EncodeAgentRequest(messages, modelID, mode))
+	initial := connectFrame(proto.EncodeAgentRequest(messages, modelID, mode))
+	return openAgentStream(httpx.Client(proxyURL), runURL(), agentHeaders(bearer, "application/connect+proto"), initial, modelID)
+}
 
+func openAgentStream(client *http.Client, endpoint string, headers http.Header, initial []byte, modelID string) (*AgentStream, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, runURL(), strings.NewReader(string(body)))
-	req.Header = agentHeaders(bearer, "application/connect+proto")
-
-	resp, err := httpx.Client(proxyURL).Do(req)
-	if err != nil {
+	reader, writer := io.Pipe()
+	stopClosing := context.AfterFunc(ctx, func() { _ = reader.CloseWithError(ctx.Err()) })
+	// Run 是双向流。发完初始请求后仍要保留写端，供上游 KV 请求回包。
+	body := struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(initial), reader), reader}
+	closeStream := func() {
 		cancel()
+		stopClosing()
+		_ = reader.Close()
+		_ = writer.Close()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		closeStream()
+		return nil, NewAgentUpstreamError(0, err.Error())
+	}
+	req.Header = headers
+	cfg := config.Get()
+	headerTimeout := time.Duration(max(cfg.AgentFirstTokenMs, cfg.AgentIdleMs)) * time.Millisecond
+	setup := time.AfterFunc(headerTimeout, cancel)
+	resp, err := client.Do(req)
+	if err != nil {
+		setup.Stop()
+		closeStream()
 		return nil, NewAgentUpstreamError(0, err.Error())
 	}
 	if resp.StatusCode != http.StatusOK || resp.Body == nil {
-		raw, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		cancel()
+		_ = writer.Close()
+		var raw []byte
+		if resp.Body != nil {
+			raw, _ = io.ReadAll(io.LimitReader(resp.Body, 300))
+			_ = resp.Body.Close()
+		}
+		setup.Stop()
+		closeStream()
 		msg := snippet(raw, 300)
 		if msg == "" {
 			msg = resp.Status
 		}
 		return nil, NewAgentUpstreamError(resp.StatusCode, msg)
 	}
+	setup.Stop()
 
 	events := make(chan StreamEvent, 32)
-	go pumpAgentStream(ctx, resp.Body, events, modelID)
-	return &AgentStream{Events: events, cancel: cancel}, nil
+	go func() {
+		defer closeStream()
+		pumpAgentStream(ctx, resp.Body, events, modelID, func(reply []byte) error {
+			// 请求侧流控停滞时，释放管道，避免卡住收帧和超时处理。
+			deadline := time.AfterFunc(time.Duration(cfg.AgentIdleMs)*time.Millisecond, func() {
+				_ = reader.CloseWithError(context.DeadlineExceeded)
+			})
+			defer deadline.Stop()
+			_, err := writer.Write(reply)
+			return err
+		})
+	}()
+	return &AgentStream{Events: events, cancel: closeStream}, nil
 }
 
-func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent, model string) {
+func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent, model string, replyKV func([]byte) error) {
+	ctx, cancel := context.WithCancel(ctx)
 	defer close(events)
 	defer body.Close()
+	defer cancel()
 
 	cfg := config.Get()
 	idle := time.Duration(cfg.AgentIdleMs) * time.Millisecond
@@ -241,7 +284,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 	}()
 
 	var buffer []byte
-	state := agentStreamState{model: model}
+	state := agentStreamState{model: model, replyKV: replyKV}
 
 	send := func(ev StreamEvent) bool {
 		select {
@@ -262,8 +305,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 			default:
 			}
 		}
-		// 一旦上游回写了会话记录（本轮结束），只再留一个很短的收尾窗口收残余帧，
-		// 而不是干等整个 idle。上游永不关连接、只发心跳，这是避免尾部空等的关键。
+		// 收到轮次结束事件后，只留一个短窗口接收剩余帧。
 		wait := idle
 		if state.turnComplete {
 			wait = finishIdle
@@ -337,7 +379,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 const (
 	fieldStreamMessage = 1  // 流式增量
 	fieldClientAction  = 2  // 要求客户端执行的动作（内置工具调用）
-	fieldConversation  = 4  // 会话记录回写
+	fieldKVServer      = 4  // 服务端 KV 请求
 	fieldHeartbeat     = 13 // StreamMessage 内的心跳（约 10s 一次）
 )
 
@@ -764,11 +806,10 @@ type agentStreamState struct {
 	// textBytes 累计产出的正文字节数，仅用于截断时的日志。
 	textBytes int
 	errored   bool // 是否已下发过错误
-	// sawGeneration 表示生成阶段已开始。用于区分开头回写的会话上下文
-	// 与结尾回写的会话记录——两者都是 fieldConversation 帧。
-	sawGeneration bool
-	// turnComplete 表示收到轮次结束事件，或在生成后收到会话记录回写。
+	// turnComplete 表示收到本轮的结束事件。
 	turnComplete bool
+	kv           agentKV
+	replyKV      func([]byte) error
 	// sawToolCall 表示本轮下发过内置工具调用。此时即便没有正文也是正常结果，
 	// 不应被上层当成空响应而重试。
 	sawToolCall bool
@@ -819,6 +860,21 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 		}
 
 		top := proto.Decode(payload)
+		if kv := proto.FirstBytes(top, fieldKVServer); kv != nil {
+			if s.replyKV == nil {
+				continue
+			}
+			reply, err := s.kv.reply(kv)
+			if err == nil && reply != nil {
+				err = s.replyKV(reply)
+			}
+			if err != nil {
+				s.errored = true
+				send(StreamEvent{Kind: EventError, Message: "Cursor KV stream: " + err.Error()})
+				return true
+			}
+			continue
+		}
 
 		// 心跳帧：上游每 10s 一个，不代表有新数据。
 		if sm := proto.FirstBytes(top, fieldStreamMessage); sm != nil {
@@ -826,7 +882,6 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			if _, isHeartbeat := smFields[fieldHeartbeat]; isHeartbeat && len(smFields) == 1 {
 				continue
 			}
-			s.sawGeneration = true
 			if proto.FirstBytes(smFields, smTurnEnded) != nil {
 				s.turnComplete = true
 				continue
@@ -835,7 +890,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			// 「进行中」帧先到：记下这次调用的工具类型与路径，
 			// 后续的参数片段才知道该不该转发。
 			if id, kind, path, field, ok := parseToolProgress(smFields); ok {
-				// 回写后又有工具活动，和收到新正文一样撤回结束判定。
+				// 结束事件之后又有工具活动，撤回结束判定。
 				s.turnComplete = false
 				if s.toolKind == nil {
 					s.toolKind = map[string]NativeToolKind{}
@@ -899,15 +954,6 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			continue
 		}
 
-		// 会话记录回写。开头也会回写一次上下文，所以只有在生成已经开始之后
-		// 出现，才说明这一轮真的结束了。
-		if _, ok := top[fieldConversation]; ok {
-			if s.sawGeneration {
-				s.turnComplete = true
-			}
-			continue
-		}
-
 		utf := string(payload)
 		if strings.Contains(utf, `"error"`) {
 			s.emitErrorFrame(utf, send)
@@ -916,7 +962,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 
 		delta := proto.DecodeAgentFrame(payload)
 		if delta.Content != "" || delta.Thinking != "" {
-			// 记录回写之后又来内容，说明这一轮还没完，撤回结束判定。
+			// 结束事件之后又来内容，撤回结束判定。
 			s.turnComplete = false
 			if delta.Content != "" {
 				s.gotContent = true

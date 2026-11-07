@@ -14,7 +14,7 @@ func TestUnknownToolIsRecordedToLog(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_new", 77, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 	collectTools(t, data)
 
 	list := toollog.List()

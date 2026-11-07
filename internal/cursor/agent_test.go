@@ -41,14 +41,14 @@ func heartbeatFrame() []byte {
 	return frame(0x00, top.Finish())
 }
 
-// conversationFrame 复刻上游在一轮结束时回写的会话记录帧：top{4: ...}。
-func conversationFrame(index int) []byte {
-	rec := proto.NewWriter()
-	rec.Int32(1, index)
-	rec.Str(3, "record")
-	top := proto.NewWriter()
-	top.Bytes(fieldConversation, rec.Finish())
-	return frame(0x00, top.Finish())
+// turnEndedFrame 复刻上游的轮次结束帧：top{1: sm{14: 空}}。
+func turnEndedFrame() []byte {
+	return frame(0x00, []byte{0x0a, 0x02, 0x72, 0x00})
+}
+
+func checkpointFrame() []byte {
+	checkpoint := proto.NewWriter().Str(1, "blob-id")
+	return frame(0x00, proto.NewWriter().Bytes(3, checkpoint.Finish()).Finish())
 }
 
 // toolCallFrame 复刻上游的「工具调用完成」帧：
@@ -80,7 +80,7 @@ func collectTools(t *testing.T, data []byte) []NativeToolCall {
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var out []NativeToolCall
 	for ev := range events {
@@ -100,7 +100,7 @@ func TestParseNativeWriteFile(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_w1", toolWriteFile, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 {
@@ -121,7 +121,7 @@ func TestParseNativeReadFile(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_r1", toolReadFile, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 || calls[0].Kind != ToolReadFile || calls[0].Path != "/etc/hostname" {
@@ -136,7 +136,7 @@ func TestParseNativeRunTerminal(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_t1", toolRunTerminal, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 {
@@ -153,7 +153,7 @@ func TestParseNativeSearchFiles(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_s1", toolSearchFiles, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 || calls[0].Kind != ToolSearchFiles || calls[0].Pattern != "foobar" {
@@ -170,7 +170,7 @@ func TestParseNativeTask(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_task1", toolTask, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 {
@@ -261,7 +261,7 @@ func TestParseNativeOtherTools(t *testing.T) {
 			tc.build(args)
 			var data []byte
 			data = append(data, toolCallFrame("toolu_x", tc.toolField, args)...)
-			data = append(data, conversationFrame(4)...)
+			data = append(data, turnEndedFrame()...)
 
 			calls := collectTools(t, data)
 			if len(calls) != 1 {
@@ -279,7 +279,7 @@ func TestParseNativeUnknownToolIsReported(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_u", 99, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 {
@@ -301,7 +301,7 @@ func TestNativeToolCallDeduplicatedByID(t *testing.T) {
 	var data []byte
 	data = append(data, toolCallFrame("toolu_dup", toolReadFile, args)...)
 	data = append(data, toolCallFrame("toolu_dup", toolReadFile, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	if calls := collectTools(t, data); len(calls) != 1 {
 		t.Fatalf("同一调用 id 应只产出一次，得到 %d", len(calls))
@@ -332,20 +332,15 @@ func (b *heldOpenBody) Close() error {
 	return nil
 }
 
-// 复刻 agentn.api5 的真实行为：开头回写会话上下文 → 流式正文 → 结尾回写会话记录，
-// 之后连接不关，只有 10s 一次的心跳。必须在记录回写后很快收尾，而不是空等 6s idle。
-func TestStreamEndsAfterConversationRecordWriteback(t *testing.T) {
+// 流式正文之间可以收到会话检查点。收到 TurnEnded 后即使上游不关连接，也应尽快收尾。
+func TestStreamEndsAfterTurnEnded(t *testing.T) {
 	var data []byte
 	data = append(data, heartbeatFrame()...)
-	// 开头的会话上下文回写：此时生成尚未开始，不能被误判为结束
-	data = append(data, conversationFrame(1)...)
-	data = append(data, conversationFrame(2)...)
-	// 生成
+	data = append(data, checkpointFrame()...)
 	data = append(data, contentFrame("答案是")...)
+	data = append(data, checkpointFrame()...)
 	data = append(data, contentFrame("2。")...)
-	// 结尾的会话记录回写
-	data = append(data, conversationFrame(4)...)
-	data = append(data, conversationFrame(5)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -355,7 +350,7 @@ func TestStreamEndsAfterConversationRecordWriteback(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text string
 	var sawEnd bool
@@ -379,7 +374,7 @@ func TestStreamEndsAfterConversationRecordWriteback(t *testing.T) {
 	}
 	// 修复前要等满 6s idle；现在只需 AGENT_FINISH_IDLE_MS（默认 400ms）。
 	if elapsed > 2*time.Second {
-		t.Fatalf("会话记录回写后耗时 %v 才收尾", elapsed)
+		t.Fatalf("收到 TurnEnded 后耗时 %v 才收尾", elapsed)
 	}
 }
 
@@ -398,7 +393,7 @@ func TestStreamEndsWhenOnlyThinkingProduced(t *testing.T) {
 
 	var data []byte
 	data = append(data, thinking("正在检查工作区规则")...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -408,7 +403,7 @@ func TestStreamEndsWhenOnlyThinkingProduced(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var sawEnd bool
 	for ev := range events {
@@ -432,7 +427,7 @@ func TestHeartbeatFramesProduceNoEvents(t *testing.T) {
 	var data []byte
 	data = append(data, contentFrame("hi")...)
 	data = append(data, heartbeatFrame()...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -440,7 +435,7 @@ func TestHeartbeatFramesProduceNoEvents(t *testing.T) {
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text string
 	deltas := 0
@@ -470,7 +465,7 @@ func TestStreamEndsImmediatelyOnEndOfStreamFrame(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text string
 	var sawEnd bool
@@ -499,10 +494,7 @@ func TestStreamEndsImmediatelyOnEndOfStreamFrame(t *testing.T) {
 }
 
 func TestStreamCancellationAfterTurnCompletion(t *testing.T) {
-	completed := func() []byte { return append(contentFrame("hi"), conversationFrame(4)...) }
-	// AgentServerMessage.interaction_update (1) 内含空的 TurnEndedUpdate (14)。
-	turnEnded := frame(0x00, []byte{0x0a, 0x02, 0x72, 0x00})
-	ended := func() []byte { return append(contentFrame("hi"), turnEnded...) }
+	ended := func() []byte { return append(contentFrame("hi"), turnEndedFrame()...) }
 	args := proto.NewWriter()
 	args.Str(1, "/tmp/a.txt")
 	toolCall := toolCallFrame("call", toolReadFile, args)
@@ -514,26 +506,24 @@ func TestStreamCancellationAfterTurnCompletion(t *testing.T) {
 		code  string
 		final StreamEventKind
 	}{
-		{"completed response", completed(), 0x02, "canceled", EventEnd},
-		{"completed response with a separate error frame", completed(), 0x00, "canceled", EventEnd},
-		{"completed tool-only response", append(toolCall, conversationFrame(4)...), 0x02, "canceled", EventEnd},
-		{"turn ended without writeback", ended(), 0x02, "canceled", EventEnd},
+		{"completed tool-only response", append(toolCall, turnEndedFrame()...), 0x02, "canceled", EventEnd},
+		{"completed response", ended(), 0x02, "canceled", EventEnd},
 		{"turn ended with separate error frame", ended(), 0x00, "canceled", EventEnd},
-		{"turn ended with no output", turnEnded, 0x02, "canceled", EventError},
+		{"turn ended with no output", turnEndedFrame(), 0x02, "canceled", EventError},
 		{"response continued after turn ended", append(ended(), contentFrame(" again")...), 0x02, "canceled", EventError},
 		{"other error after turn ended", ended(), 0x02, "internal", EventError},
 		{"partial response", contentFrame("hi"), 0x02, "canceled", EventError},
-		{"response continued after writeback", append(completed(), contentFrame(" again")...), 0x02, "canceled", EventError},
-		{"tool announced after writeback", append(completed(), progressFrame("call", toolWriteFile, "/tmp/a.txt")...), 0x02, "canceled", EventError},
-		{"tool input continued after writeback", append(completed(), inputDeltaFrame("call", "text")...), 0x02, "canceled", EventError},
-		{"tool call after writeback", append(completed(), toolCall...), 0x02, "canceled", EventError},
-		{"other upstream error", completed(), 0x02, "internal", EventError},
+		{"canceled after checkpoint", append(contentFrame("hi"), checkpointFrame()...), 0x02, "canceled", EventError},
+		{"canceled after KV write", append(contentFrame("hi"), kvSetFrame("blob-id", "blob-data")...), 0x02, "canceled", EventError},
+		{"tool announced after turn ended", append(ended(), progressFrame("call", toolWriteFile, "/tmp/a.txt")...), 0x02, "canceled", EventError},
+		{"tool input continued after turn ended", append(ended(), inputDeltaFrame("call", "text")...), 0x02, "canceled", EventError},
+		{"tool call after turn ended", append(ended(), toolCall...), 0x02, "canceled", EventError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := append(tc.data, frame(tc.flag, []byte(`{"error":{"code":"`+tc.code+`"}}`))...)
 			body := io.NopCloser(readerOf(data))
 			events := make(chan StreamEvent, 8)
-			pumpAgentStream(context.Background(), body, events, "test-model")
+			pumpAgentStream(context.Background(), body, events, "test-model", func([]byte) error { return nil })
 
 			var terminal []StreamEvent
 			for ev := range events {
@@ -559,7 +549,7 @@ func TestStreamEndsOnUpstreamClose(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text string
 	for ev := range events {
@@ -582,7 +572,7 @@ func TestStreamStopsOnContextCancel(t *testing.T) {
 
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	// 读到正文后取消
 	<-events
@@ -662,14 +652,14 @@ func TestToolInputDeltasAreStreamed(t *testing.T) {
 	data = append(data, inputDeltaFrame("call-1", "print(")...)
 	data = append(data, inputDeltaFrame("call-1", "\"hi\")\n")...)
 	data = append(data, toolCallFrame("call-1", toolWriteFile, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var streamed string
 	var done int
@@ -731,7 +721,7 @@ func TestHardCapMarksTruncated(t *testing.T) {
 	events := make(chan StreamEvent, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var gotText, sawEnd, truncated bool
 	for ev := range events {
@@ -759,7 +749,7 @@ func TestHardCapMarksTruncated(t *testing.T) {
 func TestNormalEndIsNotTruncated(t *testing.T) {
 	var data []byte
 	data = append(data, contentFrame("好的")...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -767,7 +757,7 @@ func TestNormalEndIsNotTruncated(t *testing.T) {
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	for ev := range events {
 		if ev.Kind == EventEnd && ev.Truncated {
@@ -794,7 +784,7 @@ func TestParseNativeUpdateTodos(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_todo", toolUpdateTodos, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 {
@@ -823,7 +813,7 @@ func TestParseNativeAwait(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_await", toolAwait, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 || calls[0].Kind != ToolAwait {
@@ -839,7 +829,7 @@ func TestUnknownToolCarriesUpstreamName(t *testing.T) {
 
 	var data []byte
 	data = append(data, toolCallFrame("toolu_rec", 29, args)...) // record_screen
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 {
@@ -871,7 +861,7 @@ func TestMetaFieldsAreNotReportedAsTools(t *testing.T) {
 
 	var data []byte
 	data = append(data, frame(0x00, top.Finish())...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	calls := collectTools(t, data)
 	if len(calls) != 1 {
@@ -888,7 +878,7 @@ func TestMetaFieldsAreNotReportedAsTools(t *testing.T) {
 func TestAnnouncedButUnfinishedToolIsReported(t *testing.T) {
 	var data []byte
 	data = append(data, progressFrame("toolu_ws", toolWebSearch, "")...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -896,7 +886,7 @@ func TestAnnouncedButUnfinishedToolIsReported(t *testing.T) {
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text string
 	for ev := range events {
@@ -918,7 +908,7 @@ func TestAbandonedAnnouncementIsSilentWhenTurnProduced(t *testing.T) {
 	var data []byte
 	data = append(data, contentFrame("这是正常的回答内容。")...)
 	data = append(data, progressFrame("toolu_ws", toolWebSearch, "")...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -926,7 +916,7 @@ func TestAbandonedAnnouncementIsSilentWhenTurnProduced(t *testing.T) {
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text string
 	for ev := range events {
@@ -949,7 +939,7 @@ func TestIncompleteArgsStillReportsCall(t *testing.T) {
 	var data []byte
 	data = append(data, progressFrame("toolu_w", toolWriteFile, "")...)
 	data = append(data, toolCallFrame("toolu_w", toolWriteFile, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -957,7 +947,7 @@ func TestIncompleteArgsStillReportsCall(t *testing.T) {
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var calls []NativeToolCall
 	var text string
@@ -989,7 +979,7 @@ func TestCompletedToolIsNotReportedAsUnfinished(t *testing.T) {
 	var data []byte
 	data = append(data, progressFrame("toolu_w1", toolWriteFile, "/tmp/a.py")...)
 	data = append(data, toolCallFrame("toolu_w1", toolWriteFile, args)...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -997,7 +987,7 @@ func TestCompletedToolIsNotReportedAsUnfinished(t *testing.T) {
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	for ev := range events {
 		if ev.Kind == EventDelta && strings.Contains(ev.Text, "没有给出参数") {
@@ -1051,14 +1041,14 @@ func TestHeartbeatsKeepStreamAliveWhileThinking(t *testing.T) {
 
 	var tail []byte
 	tail = append(tail, contentFrame("想好了")...)
-	tail = append(tail, conversationFrame(4)...)
+	tail = append(tail, turnEndedFrame()...)
 	body := &heartbeatOnlyBody{silence: 700 * time.Millisecond, tail: tail, done: make(chan struct{})}
 	defer body.Close()
 
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text, errMsg string
 	for ev := range events {
@@ -1093,7 +1083,7 @@ func TestThinkingBudgetGivesAccurateError(t *testing.T) {
 	events := make(chan StreamEvent, 32)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	errMsg := ""
 	for ev := range events {
@@ -1122,7 +1112,7 @@ func TestNoFrameAtAllStillBlamesRoute(t *testing.T) {
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	errMsg := ""
 	for ev := range events {
@@ -1150,7 +1140,7 @@ func TestUnfinishedAnnouncementUsesUpstreamName(t *testing.T) {
 	var data []byte
 	// 字段 28 = generate_image，我们不解析它的参数
 	data = append(data, progressFrame("toolu_img", 28, "")...)
-	data = append(data, conversationFrame(4)...)
+	data = append(data, turnEndedFrame()...)
 
 	body := &heldOpenBody{data: data, release: make(chan struct{})}
 	defer body.Close()
@@ -1158,7 +1148,7 @@ func TestUnfinishedAnnouncementUsesUpstreamName(t *testing.T) {
 	events := make(chan StreamEvent, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go pumpAgentStream(ctx, body, events, "test-model")
+	go pumpAgentStream(ctx, body, events, "test-model", nil)
 
 	var text string
 	for ev := range events {
