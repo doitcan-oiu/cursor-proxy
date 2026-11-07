@@ -303,7 +303,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	open := func() (*OpenedStream, *cursor.UpstreamError) {
-		return OpenWithFailover(ctx, messages, model, ModeFor(len(toolDefs)), len(toolDefs) > 0, fileTools)
+		return OpenWithFailover(ctx, messages, model, ModeFor(len(toolDefs)), len(toolDefs) > 0, body.Stream, fileTools)
 	}
 	var opened *OpenedStream
 	var uerr *cursor.UpstreamError
@@ -315,6 +315,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wire = newSSEResponse(ctx, cancel, w)
+		wire.heartbeat = sse("ping", map[string]any{"type": "ping"})
 		startStream = func() {
 			if wire.started {
 				return
@@ -327,7 +328,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 					"usage": input.anthropic(0),
 				},
 			}))
-			wire.write(sse("ping", map[string]any{"type": "ping"}))
+			wire.write(wire.heartbeat)
 		}
 		opened, uerr = wire.awaitOpen(startedAt, startStream, open)
 	} else {
@@ -408,7 +409,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 					tl.mark("等首个增量")
 				}
 				if blk.thinking(ev.Thinking) {
-					wire.markOutput()
+					wire.markThinking()
 					thinking.WriteString(ev.Thinking)
 				}
 				if ev.Text != "" {
@@ -443,7 +444,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		}
 		if !errored && !wire.disconnected() {
 			emitText(toolOutput.flush())
-			if message, _ := toolOutput.completionError(toolChoice, truncated); message != "" {
+			if message, _ := toolOutput.streamCompletionError(toolChoice, truncated, content.Len(), thinking.Len()); message != "" {
 				errored, errMsg = true, message
 				terminalDelivered = send("error", anthropicAPIError(errMsg))
 			}
@@ -477,7 +478,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
 			}
 		}
-		outputTokens := countOutputTokens(model, content.String(), thinking.String(), deliveredCalls)
+		thinkingTokens := tokenize.CountText(model, thinking.String())
+		outputTokens := countOutputTokens(model, content.String(), "", deliveredCalls) + thinkingTokens
 		if !errored && !wire.disconnected() {
 			send("message_delta", map[string]any{
 				"type":  "message_delta",
@@ -501,6 +503,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(),
 			HTTPStatus: httpStatus, InputTokens: inputTokens, FirstTokenMs: wire.firstTokenMs(startedAt),
+			FirstThinkingMs: elapsedMs(startedAt, wire.thinkingAt), ThinkingTokens: thinkingTokens,
 			Chars: utf8.RuneCountInString(content.String()), Tokens: outputTokens,
 			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
 		return

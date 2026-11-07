@@ -259,7 +259,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	open := func() (*OpenedStream, *cursor.UpstreamError) {
-		return OpenWithFailover(ctx, messages, body.Model, ModeFor(len(toolDefs)), len(toolDefs) > 0, fileTools)
+		return OpenWithFailover(ctx, messages, body.Model, ModeFor(len(toolDefs)), len(toolDefs) > 0, body.Stream, fileTools)
 	}
 	var opened *OpenedStream
 	var uerr *cursor.UpstreamError
@@ -271,6 +271,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wire = newSSEResponse(ctx, cancel, w)
+		// 重新编码 SSE 的网关可能丢掉注释。空增量不计入正文或 token。
+		wire.heartbeat = sseChunk(id, body.Model, map[string]any{}, nil)
 		startStream = func() {
 			if !wire.started {
 				wire.write(sseChunk(id, body.Model, map[string]any{"role": "assistant"}, nil))
@@ -349,7 +351,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					tl.mark("等首个增量")
 				}
 				if ev.Thinking != "" && wire.write(sseChunk(id, body.Model, map[string]any{"reasoning_content": ev.Thinking}, nil)) {
-					wire.markOutput()
+					wire.markThinking()
 					reasoning.WriteString(ev.Thinking)
 				}
 				if ev.Text != "" {
@@ -385,7 +387,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if !errored && !wire.disconnected() {
 			emitText(toolOutput.flush())
-			if message, code := toolOutput.completionError(toolChoice, truncated); message != "" {
+			if message, code := toolOutput.streamCompletionError(toolChoice, truncated, content.Len(), reasoning.Len()); message != "" {
 				errored, errMsg = true, message
 				terminalDelivered = wire.write(chatStreamError(errMsg, "upstream_error", code))
 			}
@@ -415,7 +417,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 按 OpenAI 规范：仅在 stream_options.include_usage 为真时补一个
 		// choices 为空、只带 usage 的收尾分片。
-		completionTokens := countOutputTokens(body.Model, content.String(), reasoning.String(), deliveredCalls)
+		thinkingTokens := tokenize.CountText(body.Model, reasoning.String())
+		completionTokens := countOutputTokens(body.Model, content.String(), "", deliveredCalls) + thinkingTokens
 		if !errored && body.StreamOptions != nil && body.StreamOptions.IncludeUsage && !wire.disconnected() {
 			payload, _ := json.Marshal(map[string]any{
 				"id":      id,
@@ -443,6 +446,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(),
 			HTTPStatus: httpStatus, InputTokens: promptTokens, FirstTokenMs: wire.firstTokenMs(startedAt),
+			FirstThinkingMs: elapsedMs(startedAt, wire.thinkingAt), ThinkingTokens: thinkingTokens,
 			Chars: utf8.RuneCountInString(content.String()), Tokens: completionTokens,
 			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
 		timingDetail = fmt.Sprintf(" :: 提示 %d tok / 输出 %d tok / %d 字",
@@ -664,6 +668,16 @@ func (o *toolOutput) completionError(choice tools.Choice, truncated bool) (strin
 	}
 	if requiresTool(choice) {
 		return missingToolCall, "tool_choice_not_satisfied"
+	}
+	return "", ""
+}
+
+func (o *toolOutput) streamCompletionError(choice tools.Choice, truncated bool, textBytes, thinkingBytes int) (string, string) {
+	if message, code := o.completionError(choice, truncated); message != "" {
+		return message, code
+	}
+	if !truncated && len(o.calls) == 0 && textBytes == 0 && thinkingBytes > 0 {
+		return "上游仅返回思考内容，未返回正文或工具调用", "thinking_only_response"
 	}
 	return "", ""
 }

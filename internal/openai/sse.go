@@ -51,10 +51,12 @@ type sseResponse struct {
 	writeErr   error
 	lastWrite  time.Time
 	firstToken time.Time
+	thinkingAt time.Time
+	heartbeat  string
 }
 
 func newSSEResponse(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter) *sseResponse {
-	return &sseResponse{w: w, controller: http.NewResponseController(w), ctx: ctx, cancel: cancel}
+	return &sseResponse{w: w, controller: http.NewResponseController(w), ctx: ctx, cancel: cancel, heartbeat: ": keepalive\n\n"}
 }
 
 // write 在 handler 自己的 goroutine 中写入并刷新一帧。首个写入失败会停止上游。
@@ -99,7 +101,9 @@ func (s *sseResponse) disconnectMessage() string {
 	}
 	stage := "起始帧发出前"
 	if !s.firstToken.IsZero() {
-		stage = "已有输出"
+		stage = "正文或工具增量已写出，结束帧未写完"
+	} else if !s.thinkingAt.IsZero() {
+		stage = "仅已写出思考增量"
 	} else if !s.lastWrite.IsZero() {
 		stage = "已发起始帧，尚无输出"
 	}
@@ -115,22 +119,32 @@ func (s *sseResponse) markOutput() {
 	}
 }
 
+func (s *sseResponse) markThinking() {
+	if s.thinkingAt.IsZero() {
+		s.thinkingAt = s.lastWrite
+	}
+}
+
 func (s *sseResponse) firstTokenMs(startedAt time.Time) *int64 {
-	if s.firstToken.IsZero() {
+	return elapsedMs(startedAt, s.firstToken)
+}
+
+func elapsedMs(startedAt, at time.Time) *int64 {
+	if at.IsZero() {
 		return nil
 	}
-	ms := s.firstToken.Sub(startedAt).Milliseconds()
+	ms := at.Sub(startedAt).Milliseconds()
 	return &ms
 }
 
 func (s *sseResponse) keepalive() {
 	if time.Since(s.lastWrite) >= streamKeepalive {
-		s.write(": keepalive\n\n")
+		s.write(s.heartbeat)
 	}
 }
 
-// awaitOpen 保留快速失败的 HTTP 状态。上游等待较久时先发协议起始帧，
-// 让中转服务的首事件超时停止计时，之后仍可以在流中报告错误。
+// awaitOpen 保留快速失败的 HTTP 状态。上游等待较久时先建立 SSE，
+// 定期向下一跳发送保活帧，之后仍可以在流中报告错误。
 func (s *sseResponse) awaitOpen(startedAt time.Time, start func(), open func() (*OpenedStream, *cursor.UpstreamError)) (*OpenedStream, *cursor.UpstreamError) {
 	type result struct {
 		stream *OpenedStream

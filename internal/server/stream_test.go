@@ -24,13 +24,21 @@ type streamTestTransport func(*http.Request) (*http.Response, error)
 
 func (f streamTestTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func relayTestReply() []byte {
-	text := proto.NewWriter().Str(1, "relay output").Finish()
-	update := proto.NewWriter().Bytes(1, text).Finish()
+func relayTestDelta(field int, text string) []byte {
+	delta := proto.NewWriter().Str(1, text).Finish()
+	update := proto.NewWriter().Bytes(field, delta).Finish()
 	message := proto.NewWriter().Bytes(1, update).Finish()
+	return cursor.EncodeConnectEnvelope(message, false)
+}
+
+func relayTestEnd() []byte {
 	end := cursor.EncodeConnectEnvelope([]byte("{}"), false)
 	end[0] = 2
-	return append(cursor.EncodeConnectEnvelope(message, false), end...)
+	return end
+}
+
+func relayTestReply() []byte {
+	return append(relayTestDelta(1, "relay output"), relayTestEnd()...)
 }
 
 type failOutputFlush struct {
@@ -62,6 +70,7 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "test-admin")
 	t.Setenv("CURSOR_HTTP_PROXY", proxyURL)
 	t.Setenv("TOKENIZER", "estimate")
+	t.Setenv("PROXY_MAX_ATTEMPTS", "2")
 	config.Reset()
 	t.Cleanup(config.Reset)
 	auth.AddCursorToken("fake-cursor-token", "test-account", "")
@@ -70,13 +79,29 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 	oldTransport := upstreamClient.Transport
 	t.Cleanup(func() { upstreamClient.Transport = oldTransport })
 
+	type protocol struct {
+		name, path, start, end, thinking, keepalive string
+	}
+	openAI := protocol{"OpenAI", "/v1/chat/completions", `"role":"assistant"`, "data: [DONE]", `"reasoning_content":"relay thinking"`, `"delta":{},"finish_reason":null`}
+	anthropic := protocol{"Anthropic", "/v1/messages", `"type":"message_start"`, `"type":"message_stop"`, `"thinking":"relay thinking"`, `"type":"ping"`}
 	for _, tc := range []struct {
-		name, path, start, end string
-		disconnect             bool
+		name          string
+		protocol      protocol
+		thinking      bool
+		noText        bool
+		disconnect    bool
+		waitKeepalive bool
 	}{
-		{"slow OpenAI completion", "/v1/chat/completions", `"role":"assistant"`, "data: [DONE]", false},
-		{"slow Anthropic completion", "/v1/messages", `"type":"message_start"`, `"type":"message_stop"`, false},
-		{"Anthropic relay disconnect before text", "/v1/messages", `"type":"message_start"`, "", true},
+		{name: "slow OpenAI completion", protocol: openAI},
+		{name: "slow Anthropic completion", protocol: anthropic},
+		{name: "OpenAI relay disconnect after keepalive before output", protocol: openAI, disconnect: true, waitKeepalive: true},
+		{name: "Anthropic relay disconnect before text", protocol: anthropic, disconnect: true},
+		{name: "OpenAI streams thinking before text", protocol: openAI, thinking: true},
+		{name: "Anthropic streams thinking before text", protocol: anthropic, thinking: true},
+		{name: "OpenAI thinking without text is an error", protocol: openAI, thinking: true, noText: true},
+		{name: "Anthropic thinking without text is an error", protocol: anthropic, thinking: true, noText: true},
+		{name: "OpenAI relay disconnect after thinking", protocol: openAI, thinking: true, disconnect: true},
+		{name: "Anthropic relay disconnect after thinking", protocol: anthropic, thinking: true, disconnect: true, waitKeepalive: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reqlog.Clear()
@@ -91,13 +116,22 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 					close(upstreamCanceled)
 				})
 				go func() {
+					defer writer.Close()
+					if tc.thinking {
+						if _, err := writer.Write(relayTestDelta(4, "relay thinking")); err != nil {
+							return
+						}
+					}
 					select {
 					case <-releaseOutput:
 					case <-r.Context().Done():
 						return
 					}
-					defer writer.Close()
-					_, _ = writer.Write(relayTestReply())
+					if tc.noText {
+						_, _ = writer.Write(relayTestEnd())
+					} else {
+						_, _ = writer.Write(relayTestReply())
+					}
 				}()
 				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: reader}, nil
 			})
@@ -111,7 +145,7 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
-			request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+tc.path,
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+tc.protocol.path,
 				strings.NewReader(`{"model":"auto","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}`))
 			if err != nil {
 				t.Fatal(err)
@@ -132,10 +166,37 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 					t.Fatalf("reading start frame before model output: %v", err)
 				}
 				if strings.HasPrefix(line, "data: ") {
-					if !strings.Contains(line, tc.start) {
+					if !strings.Contains(line, tc.protocol.start) {
 						t.Fatalf("unexpected start frame %q", line)
 					}
 					break
+				}
+			}
+			if tc.thinking {
+				// Wait for reasoning while the upstream is still blocked from sending text or a terminator.
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						t.Fatalf("reading thinking before model output: %v", err)
+					}
+					if strings.HasPrefix(line, "data: ") && strings.Contains(line, tc.protocol.thinking) {
+						break
+					}
+				}
+			}
+			if tc.waitKeepalive {
+				// Require a protocol data frame while upstream text is still withheld.
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						t.Fatalf("reading %s keepalive: %v", tc.protocol.name, err)
+					}
+					if strings.HasPrefix(line, "data: ") && strings.Contains(line, tc.protocol.keepalive) {
+						if !json.Valid([]byte(strings.TrimPrefix(line, "data: "))) {
+							t.Fatalf("invalid %s keepalive frame: %q", tc.protocol.name, line)
+						}
+						break
+					}
 				}
 			}
 			if tc.disconnect {
@@ -144,7 +205,12 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 			} else {
 				close(releaseOutput)
 				remaining, err := io.ReadAll(reader)
-				if err != nil || !strings.Contains(string(remaining), "relay output") || !strings.Contains(string(remaining), tc.end) || strings.Contains(string(remaining), tc.start) {
+				body := string(remaining)
+				if tc.noText {
+					if err != nil || !strings.Contains(body, `"error"`) || !strings.Contains(body, "上游仅返回思考内容") || strings.Contains(body, tc.protocol.end) {
+						t.Fatalf("expected error after reasoning without text, got: %s (%v)", body, err)
+					}
+				} else if err != nil || !strings.Contains(body, "relay output") || !strings.Contains(body, tc.protocol.end) || strings.Contains(body, tc.protocol.start) {
 					t.Fatalf("missing downstream output: %s (%v)", remaining, err)
 				}
 			}
@@ -160,19 +226,65 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 				t.Fatalf("got %d log entries, want 1", len(entries))
 			}
 			entry := entries[0]
-			if entry.InputTokens <= 0 || entry.Ms <= 0 || entry.TPS == nil {
+			if entry.InputTokens <= 0 || entry.Ms < 0 || (entry.Ms > 0 && entry.TPS == nil) {
 				t.Fatalf("missing log metrics: %+v", entry)
 			}
-			if tc.disconnect {
-				if entry.Status == "ok" || entry.HTTPStatus != 499 || entry.Tokens != 0 || entry.FirstTokenMs != nil ||
-					!strings.Contains(entry.Error, "已发起始帧，尚无输出") {
-					t.Fatalf("disconnect logged as output or success: %+v", entry)
+			if tc.thinking {
+				if entry.FirstThinkingMs == nil || entry.ThinkingTokens <= 0 || entry.Tokens < entry.ThinkingTokens ||
+					(entry.FirstTokenMs != nil && *entry.FirstThinkingMs > *entry.FirstTokenMs) {
+					t.Fatalf("missing or out-of-order thinking metrics: %+v", entry)
 				}
-			} else if entry.Status != "ok" || entry.Tokens <= 0 || entry.FirstTokenMs == nil || *entry.FirstTokenMs > entry.Ms || *entry.TPS <= 0 {
+			} else if entry.FirstThinkingMs != nil || entry.ThinkingTokens != 0 {
+				t.Fatalf("non-thinking frame counted as thinking: %+v", entry)
+			}
+			if tc.disconnect {
+				stage := "已发起始帧，尚无输出"
+				if tc.thinking {
+					stage = "仅已写出思考"
+				}
+				if entry.Status == "ok" || entry.HTTPStatus != 499 || entry.Chars != 0 || entry.FirstTokenMs != nil ||
+					(!tc.thinking && entry.Tokens != 0) || !strings.Contains(entry.Error, stage) {
+					t.Fatalf("disconnect logged as visible output or success: %+v", entry)
+				}
+			} else if tc.noText {
+				if entry.Status == "ok" || entry.HTTPStatus == 499 || entry.Chars != 0 || entry.FirstTokenMs != nil ||
+					!strings.Contains(entry.Error, "上游仅返回思考内容") {
+					t.Fatalf("incomplete thinking-only reply logged as visible output or success: %+v", entry)
+				}
+			} else if entry.Status != "ok" || entry.Tokens <= 0 || entry.FirstTokenMs == nil || *entry.FirstTokenMs > entry.Ms ||
+				(entry.TPS != nil && *entry.TPS <= 0) {
 				t.Fatalf("incomplete successful output metrics: %+v", entry)
 			}
 		})
 	}
+
+	t.Run("nonstream retries a thinking-only response", func(t *testing.T) {
+		reqlog.Clear()
+		t.Cleanup(reqlog.Clear)
+		for _, p := range []protocol{openAI, anthropic} {
+			t.Run(p.name, func(t *testing.T) {
+				attempts := 0
+				upstreamClient.Transport = streamTestTransport(func(r *http.Request) (*http.Response, error) {
+					_ = r.Body.Close()
+					attempts++
+					reply := relayTestReply()
+					if attempts == 1 {
+						reply = append(relayTestDelta(4, "relay thinking"), relayTestEnd()...)
+					}
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(reply))}, nil
+				})
+				request := httptest.NewRequest(http.MethodPost, p.path,
+					strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"hello"}]}`))
+				request.Header.Set("Authorization", "Bearer "+key)
+				response := httptest.NewRecorder()
+				New().ServeHTTP(response, request)
+				body := response.Body.String()
+				if attempts != 2 || response.Code != 200 || !strings.Contains(body, "relay output") || strings.Contains(body, "relay thinking") {
+					t.Fatalf("expected second attempt without first attempt's thinking, got %d attempts, status %d, body %s", attempts, response.Code, body)
+				}
+			})
+		}
+	})
 
 	t.Run("failed flush does not count output", func(t *testing.T) {
 		reqlog.Clear()

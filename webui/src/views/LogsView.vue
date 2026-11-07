@@ -40,7 +40,9 @@ function report(e: LogEntry) {
       httpStatus: e.httpStatus,
       inputTokens: e.inputTokens,
       outputTokens: e.tokens,
+      thinkingTokens: e.thinkingTokens,
       firstTokenMs: e.firstTokenMs,
+      firstThinkingMs: e.firstThinkingMs,
       ms: e.ms,
       tps: e.tps,
       error: e.error,
@@ -202,7 +204,7 @@ onUnmounted(() => window.clearInterval(timer))
               <th scope="col" class="px-4 py-3 font-semibold">账号</th>
               <th scope="col" class="px-4 py-3 text-right font-semibold">输入</th>
               <th scope="col" class="px-4 py-3 text-right font-semibold">输出</th>
-              <th scope="col" class="px-4 py-3 text-right font-semibold whitespace-nowrap">首字时间</th>
+              <th scope="col" class="px-4 py-3 text-right font-semibold whitespace-nowrap" title="首段正文或工具参数写出时间">首字时间</th>
               <th scope="col" class="px-4 py-3 text-right font-semibold whitespace-nowrap">完整时间</th>
               <th scope="col" class="px-4 py-3 text-right font-semibold" title="端到端平均速度（输出 token 数 ÷ 完整耗时秒数）">TPS</th>
               <th scope="col" class="px-4 py-3 text-right font-semibold">状态</th>
@@ -221,9 +223,13 @@ onUnmounted(() => window.clearInterval(timer))
                   <div class="max-w-[200px] truncate" :title="e.account">{{ e.account || '—' }}</div>
                 </td>
                 <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ formatTokens(e.inputTokens) }}</td>
-                <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ formatTokens(e.tokens) }}</td>
+                <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">
+                  {{ formatTokens(e.tokens) }}
+                  <div v-if="e.thinkingTokens" class="text-xs">含思考 {{ formatTokens(e.thinkingTokens) }}</div>
+                </td>
                 <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">
                   {{ e.firstTokenMs == null ? '—' : formatDuration(e.firstTokenMs) }}
+                  <div v-if="e.firstThinkingMs != null" class="text-xs">思考 {{ formatDuration(e.firstThinkingMs) }}</div>
                 </td>
                 <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ formatDuration(e.ms) }}</td>
                 <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ e.tps == null ? '—' : e.tps.toFixed(1) }}</td>

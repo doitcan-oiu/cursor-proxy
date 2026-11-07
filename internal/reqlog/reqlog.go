@@ -8,23 +8,25 @@ import (
 
 // Entry 一条请求日志。
 type Entry struct {
-	ID           int64    `json:"id"`
-	Time         int64    `json:"time"`
-	Kind         string   `json:"kind"`
-	Model        string   `json:"model,omitempty"`
-	Account      string   `json:"account,omitempty"`
-	KeyPrefix    string   `json:"keyPrefix,omitempty"`
-	Stream       bool     `json:"stream,omitempty"`
-	Status       string   `json:"status"`
-	HTTPStatus   int      `json:"httpStatus,omitempty"`
-	Ms           int64    `json:"ms"`
-	Chars        int      `json:"chars,omitempty"`
-	FirstTokenMs *int64   `json:"firstTokenMs,omitempty"`
-	TPS          *float64 `json:"tps,omitempty"`
-	InputTokens  int      `json:"inputTokens,omitempty"`
+	ID              int64    `json:"id"`
+	Time            int64    `json:"time"`
+	Kind            string   `json:"kind"`
+	Model           string   `json:"model,omitempty"`
+	Account         string   `json:"account,omitempty"`
+	KeyPrefix       string   `json:"keyPrefix,omitempty"`
+	Stream          bool     `json:"stream,omitempty"`
+	Status          string   `json:"status"`
+	HTTPStatus      int      `json:"httpStatus,omitempty"`
+	Ms              int64    `json:"ms"`
+	Chars           int      `json:"chars,omitempty"`
+	FirstTokenMs    *int64   `json:"firstTokenMs,omitempty"`
+	FirstThinkingMs *int64   `json:"firstThinkingMs,omitempty"`
+	TPS             *float64 `json:"tps,omitempty"`
+	InputTokens     int      `json:"inputTokens,omitempty"`
 	// Tokens 是输出 token 的估算值（见 internal/tokenize）。
-	Tokens int    `json:"tokens"`
-	Error  string `json:"error,omitempty"`
+	Tokens         int    `json:"tokens"`
+	ThinkingTokens int    `json:"thinkingTokens,omitempty"`
+	Error          string `json:"error,omitempty"`
 	// Request 是出错时留存的请求体（已去掉图片载荷并截断）。
 	// 只有失败的请求才留，用于复现问题；成功的请求不留，避免白占内存。
 	Request string `json:"request,omitempty"`
