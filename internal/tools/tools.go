@@ -1,11 +1,7 @@
 // Package tools 用提示词模拟 function calling。
 //
-// 为什么要模拟：Cursor 的 agent 端点只认自己内置的那套工具，工具身份是
-// protobuf 里写死的字段号（如字段 7 = 读文件），协议里没有任何位置能承载
-// 客户端声明的具名函数与 JSON Schema。所以原生透传做不到。
-//
-// 做法是把客户端声明的工具写进提示词，约定模型用固定标签输出调用意图，
-// 再从输出流里把这段标签剥离、还原成标准的 tool_calls。
+// 原生桥接和 MCP 注册以外的客户端工具会写进提示词，约定模型用固定标签
+// 输出调用意图，再从输出流还原成标准的 tool_calls。
 package tools
 
 import (
@@ -75,6 +71,11 @@ func BuildSystemPrompt(defs []Definition, choice Choice) string {
 	b.WriteString("- Results come back in the next turn; then continue the task.\n")
 	b.WriteString("- Use this format ONLY for the tools listed below. Keep using your built-in tools normally\n")
 	b.WriteString("  for anything else.\n")
+	if FileToolsNeedDistinctCalls(defs) {
+		b.WriteString("- For file writes and partial edits in the user's workspace, call the corresponding client tool\n")
+		b.WriteString("  using this format. Write the block as assistant response text.\n")
+		b.WriteString("  Do not select a built-in function for these client file operations.\n")
+	}
 	// 上游是个 agent，宣告动作后直接结束轮次是它的常见行为，
 	// 对代理来说等于这一轮什么也没发生。
 	b.WriteString("- NEVER announce that you will use one of these tools and then stop. If you say you will,\n")
@@ -143,9 +144,19 @@ func NewCallID() string {
 // 它会处理标签被切分到多个块的情况——例如上一块以 "<tool_" 结尾，
 // 这部分会被暂存，不会被当作正文吐出去。
 type Scanner struct {
-	pending strings.Builder
-	calls   []Call
-	failed  int
+	handleCall func(Call) bool
+	pending    strings.Builder
+	calls      []Call
+	failed     int
+	// 搜索闭合标签时跨增量保留位置和 JSON 字符串状态。
+	scanned int
+	quoted  bool
+	escaped bool
+}
+
+// NewScanner 把已解析的调用交给 handleCall；返回 false 时保留原始标签。
+func NewScanner(handleCall func(Call) bool) *Scanner {
+	return &Scanner{handleCall: handleCall}
 }
 
 // Push 喂入一段增量，返回其中可以直接输出的正文。
@@ -175,7 +186,7 @@ func (s *Scanner) drain(final bool) string {
 			break
 		}
 		rest := buf[open+len(OpenTag):]
-		close := strings.Index(rest, CloseTag)
+		close := s.findClose(rest)
 		if close < 0 {
 			// 标签还没闭合：正文部分先吐出，其余等后续增量
 			out.WriteString(buf[:open])
@@ -184,21 +195,26 @@ func (s *Scanner) drain(final bool) string {
 				// 收尾仍未闭合，原样归还，宁可多显示也不吞掉
 				out.WriteString(buf)
 				buf = ""
+				s.scanned, s.quoted, s.escaped = 0, false, false
 			}
-			s.setPending(buf)
+			if len(buf) != s.pending.Len() {
+				s.setPending(buf)
+			}
 			return out.String()
 		}
 		out.WriteString(buf[:open])
 		body := rest[:close]
-		if c, ok := ParseCall(body); ok {
-			s.calls = append(s.calls, c)
-		} else {
+		c, ok := ParseCall(body)
+		if !ok {
+			s.failed++
+		}
+		if !ok || !s.accept(c) {
 			// 解析失败时原样归还整段，宁可让客户端看到一坨标签，
 			// 也不能静默吞掉——那会变成一次彻底的空响应。
-			s.failed++
 			out.WriteString(OpenTag + body + CloseTag)
 		}
 		buf = rest[close+len(CloseTag):]
+		s.scanned, s.quoted, s.escaped = 0, false, false
 	}
 
 	// 没有起始标签：把可能是标签前缀的尾巴留到下一块
@@ -209,6 +225,46 @@ func (s *Scanner) drain(final bool) string {
 	out.WriteString(buf[:len(buf)-keep])
 	s.setPending(buf[len(buf)-keep:])
 	return out.String()
+}
+
+func (s *Scanner) accept(c Call) bool {
+	if s.handleCall != nil {
+		return s.handleCall(c)
+	}
+	s.calls = append(s.calls, c)
+	return true
+}
+
+func (s *Scanner) findClose(body string) int {
+	for i := s.scanned; i < len(body); i++ {
+		b := body[i]
+		if s.quoted {
+			switch {
+			case s.escaped:
+				s.escaped = false
+			case b == '\\':
+				s.escaped = true
+			case b == '"':
+				s.quoted = false
+			}
+			continue
+		}
+		if b == '"' {
+			s.quoted = true
+		}
+		if b == '<' {
+			if strings.HasPrefix(body[i:], CloseTag) {
+				return i
+			}
+			if strings.HasPrefix(CloseTag, body[i:]) {
+				// 闭合标签可能横跨两段增量，下一次从此处继续。
+				s.scanned = i
+				return -1
+			}
+		}
+	}
+	s.scanned = len(body)
+	return -1
 }
 
 func (s *Scanner) setPending(v string) {
@@ -270,12 +326,19 @@ func ParseCall(body string) (Call, bool) {
 	arguments := "{}"
 	if len(args) > 0 {
 		// arguments 也可能被写成 JSON 字符串，解包一层
-		var asString string
-		if json.Unmarshal(args, &asString) == nil {
-			if strings.TrimSpace(asString) != "" {
-				arguments = strings.TrimSpace(asString)
+		if args[0] == '"' {
+			var asString string
+			if json.Unmarshal(args, &asString) != nil {
+				return Call{}, false
+			}
+			arguments = strings.TrimSpace(asString)
+			if !strings.HasPrefix(arguments, "{") || !json.Valid([]byte(arguments)) {
+				return Call{}, false
 			}
 		} else {
+			if args[0] != '{' {
+				return Call{}, false
+			}
 			arguments = compactJSON(args)
 		}
 	}

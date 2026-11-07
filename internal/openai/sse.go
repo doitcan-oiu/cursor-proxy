@@ -2,9 +2,11 @@ package openai
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"cursor-proxy/internal/cursor"
 )
@@ -13,7 +15,28 @@ const (
 	clientClosedStatus = 499
 	streamStartGrace   = 2 * time.Second
 	streamKeepalive    = 2 * time.Second
+	toolArgsChunkBytes = 8 << 10
 )
+
+// writeToolArgs 把已组装好的工具参数拆成可拼接的增量，避免长文件挤进一个 SSE 事件。
+func writeToolArgs(arguments string, emit func(first bool, part string) bool) bool {
+	for first := true; ; first = false {
+		end := min(len(arguments), toolArgsChunkBytes)
+		for end > 0 && end < len(arguments) && !utf8.RuneStart(arguments[end]) {
+			end--
+		}
+		if end == 0 && len(arguments) > 0 {
+			end = min(len(arguments), toolArgsChunkBytes)
+		}
+		if !emit(first, arguments[:end]) {
+			return false
+		}
+		if end == len(arguments) {
+			return true
+		}
+		arguments = arguments[end:]
+	}
+}
 
 func clientDisconnected() *cursor.UpstreamError {
 	return cursor.NewUpstreamError(clientClosedStatus, "下游已断开连接")
@@ -25,7 +48,7 @@ type sseResponse struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	started    bool
-	failed     bool
+	writeErr   error
 	lastWrite  time.Time
 	firstToken time.Time
 }
@@ -48,8 +71,15 @@ func (s *sseResponse) write(frame string) bool {
 		s.started = true
 	}
 	n, err := io.WriteString(s.w, frame)
-	if err != nil || n != len(frame) || s.controller.Flush() != nil {
-		s.failed = true
+	if err == nil && n != len(frame) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		s.writeErr = fmt.Errorf("写入: %w", err)
+	} else if err := s.controller.Flush(); err != nil {
+		s.writeErr = fmt.Errorf("刷新: %w", err)
+	}
+	if s.writeErr != nil {
 		s.cancel()
 		return false
 	}
@@ -58,7 +88,25 @@ func (s *sseResponse) write(frame string) bool {
 }
 
 func (s *sseResponse) disconnected() bool {
-	return s.failed || s.ctx.Err() != nil
+	return s.writeErr != nil || s.ctx.Err() != nil
+}
+
+// disconnectMessage 区分对端取消和代理写出失败，并保留断流时的进度。
+func (s *sseResponse) disconnectMessage() string {
+	message := clientDisconnected().Msg
+	if s == nil {
+		return message
+	}
+	stage := "起始帧发出前"
+	if !s.firstToken.IsZero() {
+		stage = "已有输出"
+	} else if !s.lastWrite.IsZero() {
+		stage = "已发起始帧，尚无输出"
+	}
+	if s.writeErr != nil {
+		return fmt.Sprintf("SSE 向下游写出失败（%s）: %v", stage, s.writeErr)
+	}
+	return message + "（" + stage + "）"
 }
 
 func (s *sseResponse) markOutput() {
@@ -83,7 +131,7 @@ func (s *sseResponse) keepalive() {
 
 // awaitOpen 保留快速失败的 HTTP 状态。上游等待较久时先发协议起始帧，
 // 让中转服务的首事件超时停止计时，之后仍可以在流中报告错误。
-func (s *sseResponse) awaitOpen(start func(), open func() (*OpenedStream, *cursor.UpstreamError)) (*OpenedStream, *cursor.UpstreamError) {
+func (s *sseResponse) awaitOpen(startedAt time.Time, start func(), open func() (*OpenedStream, *cursor.UpstreamError)) (*OpenedStream, *cursor.UpstreamError) {
 	type result struct {
 		stream *OpenedStream
 		err    *cursor.UpstreamError
@@ -100,7 +148,8 @@ func (s *sseResponse) awaitOpen(start func(), open func() (*OpenedStream, *curso
 			}
 		}
 	}()
-	timer := time.NewTimer(streamStartGrace)
+	// 大请求的读入和分词也占用了下一跳的首包预算。
+	timer := time.NewTimer(time.Until(startedAt.Add(streamStartGrace)))
 	defer timer.Stop()
 	for {
 		select {

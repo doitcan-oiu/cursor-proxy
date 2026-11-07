@@ -65,6 +65,8 @@ const (
 	ToolListFiles NativeToolKind = "list_files"
 	// ToolFetchURL 抓取网页。
 	ToolFetchURL NativeToolKind = "fetch_url"
+	// ToolMCP 调用客户端声明的 MCP 工具。
+	ToolMCP NativeToolKind = "mcp"
 	// ToolUnknown 是尚未识别的上游工具。保留它是为了不让对话静默中断——
 	// 未映射的工具会以说明文本告知客户端，并在日志里打出字段号便于补齐。
 	ToolUnknown NativeToolKind = "unknown"
@@ -80,6 +82,10 @@ type NativeToolCall struct {
 	Path        string // ToolReadFile / ToolWriteFile
 	Command     string // ToolRunTerminal
 	Pattern     string // ToolSearchFiles
+	Glob        string // ToolSearchFiles
+	OutputMode  string // ToolSearchFiles
+	Offset      int32  // ToolReadFile
+	Limit       uint32 // ToolReadFile
 	Content     string // ToolWriteFile
 	Prompt      string // ToolTask
 	URL         string // ToolFetchURL
@@ -88,6 +94,10 @@ type NativeToolCall struct {
 	Todos []TodoItem
 	// Name 是上游给这个工具的规范名，未识别时也能报出来。
 	Name string
+	// MCPName、MCPProvider 和 Arguments 只用于 MCP 调用。
+	MCPName     string
+	MCPProvider string
+	Arguments   string
 	// Field 是未识别工具在参数容器里的字段号，用于日志排查与后续补齐。
 	Field int
 	// Raw 是未识别工具的原始参数字节，留档供补映射时复核。

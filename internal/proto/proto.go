@@ -78,7 +78,7 @@ func Decode(data []byte) map[int][]Field {
 			f.Varint = v
 		case 2:
 			l, ok := readVarint()
-			if !ok || pos+int(l) > len(data) {
+			if !ok || l > uint64(len(data)-pos) {
 				return fields
 			}
 			f.Bytes = data[pos : pos+int(l)]

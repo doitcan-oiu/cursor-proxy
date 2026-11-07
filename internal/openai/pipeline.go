@@ -73,7 +73,7 @@ func ModeFor(toolCount int) proto.Mode {
 }
 
 // OpenWithFailover 带故障转移地打开对话流：先探帧，拿到正文前出错则换号重试。
-func OpenWithFailover(ctx context.Context, messages []types.Message, model string, mode proto.Mode) (*OpenedStream, *cursor.UpstreamError) {
+func OpenWithFailover(ctx context.Context, messages []types.Message, model string, mode proto.Mode, allowTools bool, fileTools fileToolBridge) (*OpenedStream, *cursor.UpstreamError) {
 	ab := config.Get().Antiban
 	exclude := map[string]bool{}
 	var lastErr *cursor.UpstreamError
@@ -88,7 +88,7 @@ func OpenWithFailover(ctx context.Context, messages []types.Message, model strin
 		acquireMs := time.Since(t0).Milliseconds()
 
 		t1 := time.Now()
-		stream, err := cursor.StreamAgentContext(ctx, messages, upstreamModel, account.Bearer, account.ProxyURL, mode)
+		stream, err := cursor.StreamAgentContextWithMCP(ctx, messages, upstreamModel, account.Bearer, account.ProxyURL, mode, allowTools, fileTools.definitions, fileTools.prompt)
 		connectMs := time.Since(t1).Milliseconds()
 		probeStart := time.Now()
 		if err != nil {

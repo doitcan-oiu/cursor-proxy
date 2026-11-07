@@ -115,7 +115,7 @@ func TestOpenAgentStreamRepliesToKVBeforeTurnEnded(t *testing.T) {
 	client := upstream.Client()
 	client.Timeout = 5 * time.Second
 
-	stream, err := openAgentStream(context.Background(), client, upstream.URL, http.Header{}, initial, "test-model")
+	stream, err := openAgentStream(context.Background(), client, upstream.URL, http.Header{}, initial, "test-model", false)
 	if err != nil {
 		t.Fatal(err)
 	}

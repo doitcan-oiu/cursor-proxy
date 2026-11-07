@@ -110,15 +110,10 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 支持 OpenAI 的 `tools` / `tool_calls` 与 Anthropic 的 `tools` / `tool_use`，
 流式与非流式都可用，因此能对接 OpenCode 这类需要工具调用的 agent 客户端。
 
-实现方式是**提示词模拟**而非协议透传，原因是上游不具备这个能力：Cursor 的 agent
-端点用 protobuf 字段号标识自己内置的工具（如字段 7 = 读文件），协议里没有任何位置
-能承载客户端声明的具名函数与 JSON Schema。
+代理桥接 Cursor 的原生工具，并把部分文件工具注册成该请求的 MCP 工具。
+其余自定义工具通过 `<tool_call>` 文本协议还原为标准的 `tool_calls` / `tool_use`。
 
-所以这里把客户端声明的工具写进提示词，约定模型用 `<tool_call>` 标签输出调用意图，
-再从输出流里剥离该标签、还原成标准的 `tool_calls` / `tool_use`。要注意：
-
-- **只为上游没有内置对应物的自定义工具注入**。`read` / `bash` / `grep` 这类
-  上游本来就有，走原生桥接更可靠；两套协议同时存在反而会出问题（见下）。
+- `read`、`bash`、`grep` 等工具走原生桥接。文本提示只描述仍需走文本协议的工具。
 - 可靠性取决于模型是否遵守输出格式，并行多工具调用比原生能力弱。
 - 标签解析失败时会把原文原样返回，不会静默吞掉内容。
 - 请求里没有 `tools` 字段时完全不注入，普通对话的行为不受任何影响。
@@ -146,7 +141,7 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 | `grep` (5) | `grep` / `search` / `ripgrep` … |
 | `read` (8) | `read` / `view_file` / `cat` … |
 | `update_todos` (9) | `TodoWrite` / `todos` / `update_plan` …（按客户端 schema 合成数组） |
-| `edit` (12) | `write` / `edit` / `create_file` … |
+| `edit` (12) | `write` / `write_file` / `create_file` … |
 | `ls` (13) | `ls` / `list_dir` / `list_directory` … |
 | `web_search` (18) | `web_search` / `search_web` … |
 | `task` (19) | `task` / `agent` / `subagent` … |
@@ -157,8 +152,8 @@ curl http://127.0.0.1:3100/v1/chat/completions \
 其余 40 多个内置工具（`generate_image`、`computer_use`、`pi_*` 系列等）
 只登记了规范名，暂不解析参数；真被用到时客户端会收到一句带工具名的说明。
 
-文本协议作为补充，覆盖上游没有内置对应物的自定义工具。
-用 `NATIVE_TOOL_BRIDGE=off` 可关闭桥接。
+客户端的 `LS`、`Edit` 和 `apply_patch` 通过 MCP 注册。客户端同时提供整文件写入和局部修改工具时，`Write` 也通过 MCP 注册，让两种操作分别携带各自的参数。
+代理把完整参数和原始工具名交给客户端执行。用 `NATIVE_TOOL_BRIDGE=off` 可退回文本协议。
 
 **遇到没映射的工具怎么办**：未识别的工具不会被静默丢弃。管理界面有一个
 **「未识别工具」页面**（侧栏带红色角标提示数量），记录工具的规范名、字段号、

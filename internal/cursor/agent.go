@@ -124,7 +124,7 @@ func (s *agentStreamState) emitErrorFrame(payload string, send func(StreamEvent)
 		return
 	}
 	// 已产出正文或完整工具调用，并确认本轮结束后，尾部取消只表示上游关闭流。
-	if j.Error.Code == "canceled" && s.turnComplete && (s.gotContent || s.sawToolCall) {
+	if j.Error.Code == "canceled" && s.turnComplete && len(s.pendingInput) == 0 && (s.gotContent || s.sawToolCall) {
 		return
 	}
 	message := j.Error.Code
@@ -172,17 +172,22 @@ var hardCapFor = func() time.Duration {
 //
 // mode 决定上游按 agent 还是纯问答行事，见 AskMode / AgentMode。
 func StreamAgent(messages []types.Message, modelID, token, proxyURL string, mode proto.Mode) (*AgentStream, error) {
-	return StreamAgentContext(context.Background(), messages, modelID, token, proxyURL, mode)
+	return StreamAgentContext(context.Background(), messages, modelID, token, proxyURL, mode, false)
 }
 
 // StreamAgentContext 将下游取消传给 Cursor 的双向流。
-func StreamAgentContext(ctx context.Context, messages []types.Message, modelID, token, proxyURL string, mode proto.Mode) (*AgentStream, error) {
-	bearer := auth.ExtractBearer(token)
-	initial := connectFrame(proto.EncodeAgentRequest(messages, modelID, mode))
-	return openAgentStream(ctx, httpx.Client(proxyURL), runURL(), agentHeaders(bearer, "application/connect+proto"), initial, modelID)
+func StreamAgentContext(ctx context.Context, messages []types.Message, modelID, token, proxyURL string, mode proto.Mode, allowTools bool) (*AgentStream, error) {
+	return StreamAgentContextWithMCP(ctx, messages, modelID, token, proxyURL, mode, allowTools, nil, "")
 }
 
-func openAgentStream(parent context.Context, client *http.Client, endpoint string, headers http.Header, initial []byte, modelID string) (*AgentStream, error) {
+// StreamAgentContextWithMCP registers client tools for this Cursor run.
+func StreamAgentContextWithMCP(ctx context.Context, messages []types.Message, modelID, token, proxyURL string, mode proto.Mode, allowTools bool, tools []proto.MCPTool, systemPrompt string) (*AgentStream, error) {
+	bearer := auth.ExtractBearer(token)
+	initial := connectFrame(proto.EncodeAgentRequestWithMCP(messages, modelID, mode, tools, systemPrompt))
+	return openAgentStream(ctx, httpx.Client(proxyURL), runURL(), agentHeaders(bearer, "application/connect+proto"), initial, modelID, allowTools, tools...)
+}
+
+func openAgentStream(parent context.Context, client *http.Client, endpoint string, headers http.Header, initial []byte, modelID string, allowTools bool, tools ...proto.MCPTool) (*AgentStream, error) {
 	ctx, cancel := context.WithCancel(parent)
 	reader, writer := io.Pipe()
 	stopClosing := context.AfterFunc(ctx, func() { _ = reader.CloseWithError(ctx.Err()) })
@@ -240,12 +245,12 @@ func openAgentStream(parent context.Context, client *http.Client, endpoint strin
 			defer deadline.Stop()
 			_, err := writer.Write(reply)
 			return err
-		})
+		}, allowTools, tools...)
 	}()
 	return &AgentStream{Events: events, cancel: closeStream}, nil
 }
 
-func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent, model string, replyKV func([]byte) error) {
+func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent, model string, replyStream func([]byte) error, allowTools bool, tools ...proto.MCPTool) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer close(events)
 	defer body.Close()
@@ -256,6 +261,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 	finishIdle := time.Duration(cfg.AgentFinishIdleMs) * time.Millisecond
 	hardCap := hardCapFor()
 	thinking := time.Duration(cfg.AgentThinkingMs) * time.Millisecond
+	toolStartIdle := max(idle, min(time.Minute, thinking))
 	firstToken := time.Duration(cfg.AgentFirstTokenMs) * time.Millisecond
 	start := time.Now()
 
@@ -289,7 +295,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 	}()
 
 	var buffer []byte
-	state := agentStreamState{model: model, replyKV: replyKV}
+	state := agentStreamState{model: model, replyStream: replyStream, mcpTools: tools}
 
 	send := func(ev StreamEvent) bool {
 		select {
@@ -311,9 +317,21 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 			}
 		}
 		// 收到轮次结束事件后，只留一个短窗口接收剩余帧。
+		waitingToolInput := !state.turnComplete && (len(state.pendingInput) > 0 || len(state.waitingToolStarts) > 0)
+		waitingMCP := !state.turnComplete && !state.sawToolCall && !state.mcpDiscoveryAt.IsZero()
 		wait := idle
 		if state.turnComplete {
 			wait = finishIdle
+		} else if waitingToolInput {
+			// 参数仍在生成。心跳可以维持连接，但不会延长参数停滞的上限。
+			wait = min(wait, time.Until(state.lastToolInput.Add(thinking)))
+		} else if waitingMCP {
+			// Cursor 有时在发现客户端工具后才开始整块生成参数，期间没有工具增量。
+			wait = min(wait, time.Until(state.mcpDiscoveryAt.Add(thinking)))
+		} else if allowTools && state.gotContent && !state.sawToolCall {
+			// Cursor 可能先发一段说明，再静默生成整个工具参数。等首个工具帧，
+			// 以最近一次模型输出计时，避免心跳无限推迟空闲收尾。
+			wait = time.Until(state.lastOutput.Add(toolStartIdle))
 		}
 		timer.Reset(wait)
 
@@ -321,6 +339,20 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			if waitingToolInput {
+				if time.Since(state.lastToolInput) >= thinking {
+					send(StreamEvent{Kind: EventError, Message: "等待上游工具参数超时"})
+					return
+				}
+				continue
+			}
+			if waitingMCP {
+				if time.Since(state.mcpDiscoveryAt) >= thinking {
+					send(StreamEvent{Kind: EventError, Message: "等待上游 MCP 工具调用超时"})
+					return
+				}
+				continue
+			}
 			if state.turnComplete || state.gotContent || state.sawToolCall {
 				state.finish(send, false)
 				return
@@ -354,7 +386,7 @@ func pumpAgentStream(ctx context.Context, body io.ReadCloser, events chan<- Stre
 				state.sawFrame = true
 			}
 			if ch.err != nil {
-				if !state.errored && ch.err != io.EOF && !state.gotContent && !state.turnComplete {
+				if !state.errored && ch.err != io.EOF && !state.gotContent && !state.turnComplete && len(state.pendingInput) == 0 {
 					send(StreamEvent{Kind: EventError, Message: ch.err.Error()})
 					state.errored = true
 				} else {
@@ -390,7 +422,8 @@ const (
 
 // StreamMessage 里的更新字段。
 const (
-	smToolCallDone     = 2  // 调用完成：{ 1: 调用 id, 2: 参数容器, 3: 消息 id }
+	smToolCallStarted  = 2  // 参数已备齐，可交给客户端执行
+	smToolCallComplete = 3  // 执行结果，也可表示上游自行处理了调用
 	smToolCallProgress = 7  // 调用进行中：结构同上，参数尚不完整
 	smTurnEnded        = 14 // TurnEndedUpdate：轮次结束，可附带用量
 	smToolInputDelta   = 15 // 参数流式片段：{ 1: 调用 id, 2{3{1: 文本片段}} }
@@ -404,6 +437,11 @@ const (
 // 说完了，其实是这一轮没做完。宁可多一句说明，也不要静默。
 func (s *agentStreamState) finish(send func(StreamEvent) bool, truncated bool) {
 	if s.errored {
+		return
+	}
+	if len(s.pendingInput) > 0 {
+		s.errored = true
+		send(StreamEvent{Kind: EventError, Message: fmt.Sprintf("上游工具参数未收齐（%d 个调用）", len(s.pendingInput))})
 		return
 	}
 
@@ -503,6 +541,7 @@ const (
 	toolSwitchMode   = 25 // SwitchModeArgs
 	toolCreatePlan   = 17 // CreatePlanArgs
 	toolMCP          = 15 // McpArgs
+	toolGetMCPTools  = 44 // GetMcpToolsArgs
 	toolReportBug    = 45 // ReportBugArgs
 	toolSearchConvos = 69 // SearchConversationsArgs
 )
@@ -543,7 +582,7 @@ var toolKinds = map[int]NativeToolKind{
 	toolWriteFile: ToolWriteFile, toolListFiles: ToolListFiles,
 	toolWebSearch: ToolWebSearch, toolTask: ToolTask,
 	toolAskQuestion: ToolAskQuestion, toolFetch: ToolFetchURL,
-	toolFetchURL: ToolFetchURL, toolAwait: ToolAwait,
+	toolFetchURL: ToolFetchURL, toolAwait: ToolAwait, toolMCP: ToolMCP,
 }
 
 // toolMetaFields 是参数容器里与具体工具无关的附带字段，
@@ -555,16 +594,16 @@ var toolMetaFields = map[int]bool{
 	60: true, // completed_at_ms
 }
 
-// parseNativeToolCall 从「工具调用完成」帧里解出内置工具调用。
+// parseNativeToolCall 从 ToolCallStarted 帧里解出已准备好参数的内置工具调用。
 //
 // 必须从这里取而不是顶层的「客户端动作」帧：动作帧只带路径这类摘要信息
 // （例如写文件的动作帧只有路径没有内容），据此还原会得到错误的调用。
-func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
-	done := proto.FirstBytes(sm, smToolCallDone)
-	if done == nil {
+func (s *agentStreamState) parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
+	started := proto.FirstBytes(sm, smToolCallStarted)
+	if started == nil {
 		return nil
 	}
-	f := proto.Decode(done)
+	f := proto.Decode(started)
 	id := proto.FirstString(f, 1)
 	wrapper := proto.FirstBytes(f, 2)
 	if wrapper == nil {
@@ -598,8 +637,14 @@ func parseNativeToolCall(sm map[int][]proto.Field) *NativeToolCall {
 		return nil
 	}
 
-	if parse, ok := toolParsers[field]; ok {
-		if a := args(field); a != nil {
+	if parse, ok := toolParsers[field]; ok && (field != toolMCP || len(s.mcpTools) > 0) {
+		a := args(field)
+		if _, pending := s.pendingInput[id]; pending && field == toolWriteFile &&
+			(proto.FirstString(a, 1) == "" || proto.FirstString(a, 6) == "") {
+			// 已收到写入片段，只有最终帧带齐路径和内容才交给客户端写文件。
+			return nil
+		}
+		if a != nil {
 			if call := parse(a); call != nil {
 				call.ID = id
 				call.Field = field
@@ -645,6 +690,7 @@ func firstToolField(w map[int][]proto.Field) (int, []byte) {
 // 只收录「知道参数长什么样、且还原出来对客户端有用」的工具；
 // 其余的走未识别分支，靠 toolNames 报出名字即可。
 var toolParsers = map[int]func(a map[int][]proto.Field) *NativeToolCall{
+	toolMCP: parseMCPArgs,
 	toolWriteFile: func(a map[int][]proto.Field) *NativeToolCall {
 		path := proto.FirstString(a, 1)
 		if path == "" {
@@ -654,7 +700,11 @@ var toolParsers = map[int]func(a map[int][]proto.Field) *NativeToolCall{
 	},
 	toolReadFile: func(a map[int][]proto.Field) *NativeToolCall {
 		if path := proto.FirstString(a, 1); path != "" {
-			return &NativeToolCall{Kind: ToolReadFile, Path: path}
+			return &NativeToolCall{
+				Kind: ToolReadFile, Path: path,
+				// 不同 Cursor 上游版本分别用 4/5 和 2/3 承载范围。
+				Offset: int32(firstToolVarint(a, 4, 2)), Limit: uint32(firstToolVarint(a, 5, 3)),
+			}
 		}
 		return nil
 	},
@@ -670,7 +720,10 @@ var toolParsers = map[int]func(a map[int][]proto.Field) *NativeToolCall{
 	},
 	toolSearchFiles: func(a map[int][]proto.Field) *NativeToolCall {
 		if q := proto.FirstString(a, 1); q != "" {
-			return &NativeToolCall{Kind: ToolSearchFiles, Pattern: q, Path: proto.FirstString(a, 2)}
+			return &NativeToolCall{
+				Kind: ToolSearchFiles, Pattern: q, Path: proto.FirstString(a, 2),
+				Glob: proto.FirstString(a, 3), OutputMode: proto.FirstString(a, 4),
+			}
 		}
 		return nil
 	},
@@ -711,7 +764,10 @@ var toolParsers = map[int]func(a map[int][]proto.Field) *NativeToolCall{
 	toolUpdateTodos: func(a map[int][]proto.Field) *NativeToolCall {
 		items := parseTodoItems(a)
 		if len(items) == 0 {
-			return nil
+			if len(a[1]) != 0 || firstToolVarint(a, 2) != 0 {
+				return nil
+			}
+			return &NativeToolCall{Kind: ToolUpdateTodos}
 		}
 		return &NativeToolCall{Kind: ToolUpdateTodos, Todos: items, Description: items[0].Content}
 	},
@@ -722,6 +778,36 @@ var toolParsers = map[int]func(a map[int][]proto.Field) *NativeToolCall{
 	toolAskQuestion: func(a map[int][]proto.Field) *NativeToolCall {
 		return &NativeToolCall{Kind: ToolAskQuestion, Description: proto.FirstString(a, 1)}
 	},
+}
+
+func parseMCPArgs(a map[int][]proto.Field) *NativeToolCall {
+	name := proto.FirstString(a, 1)
+	toolName := proto.FirstString(a, 5)
+	if toolName == "" {
+		toolName = name
+	}
+	if toolName == "" {
+		return nil
+	}
+	arguments, ok := proto.DecodeMCPArguments(a[2])
+	if !ok {
+		return nil
+	}
+	return &NativeToolCall{
+		Kind: ToolMCP, Name: toolName, MCPName: name,
+		MCPProvider: proto.FirstString(a, 4), Arguments: arguments,
+	}
+}
+
+func firstToolVarint(fields map[int][]proto.Field, numbers ...int) uint64 {
+	for _, number := range numbers {
+		for _, f := range fields[number] {
+			if f.WireType == 0 {
+				return f.Varint
+			}
+		}
+	}
+	return 0
 }
 
 func fetchParser(a map[int][]proto.Field) *NativeToolCall {
@@ -805,6 +891,7 @@ func isPrintableText(s string) bool {
 // agentStreamState 跟踪一次流的解析状态。
 type agentStreamState struct {
 	gotContent bool // 是否已产出过正文
+	lastOutput time.Time
 	// sawFrame 表示收到过上游的字节（含心跳）。
 	// 用来区分「线路不通」和「模型在慢慢想」——两者的等待预算完全不同。
 	sawFrame bool
@@ -814,7 +901,10 @@ type agentStreamState struct {
 	// turnComplete 表示收到本轮的结束事件。
 	turnComplete bool
 	kv           agentKV
-	replyKV      func([]byte) error
+	replyStream  func([]byte) error
+	mcpTools     []proto.MCPTool
+	// mcpDiscoveryAt 的等待上限不受后续心跳或重复发现请求影响。
+	mcpDiscoveryAt time.Time
 	// sawToolCall 表示本轮下发过内置工具调用。此时即便没有正文也是正常结果，
 	// 不应被上层当成空响应而重试。
 	sawToolCall bool
@@ -825,6 +915,11 @@ type agentStreamState struct {
 	// announced 记录「进行中」帧宣告过的调用；收到完成帧后由 emitted 抵消。
 	// 收尾时还剩下的，就是上游宣告了却没做完的工具。
 	announced map[string]string
+	// pendingInput 只记录已经收到实际参数片段、尚未拿到完整调用的工具。
+	pendingInput map[string]struct{}
+	// waitingToolStarts 跟踪写入和 MCP 宣告，直到收到参数或完成帧。
+	waitingToolStarts map[string]struct{}
+	lastToolInput     time.Time
 	// toolKind / toolPath 记录每次调用的工具类型与路径。
 	// 「进行中」帧先于参数片段到达，据此判断片段要不要转发。
 	toolKind map[string]NativeToolKind
@@ -863,15 +958,19 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			*buffer = b[pos:]
 			return true
 		}
+		if trimmed := bytes.TrimSpace(payload); bytes.HasPrefix(trimmed, []byte("{")) && json.Valid(trimmed) {
+			s.emitErrorFrame(string(trimmed), send)
+			continue
+		}
 
 		top := proto.Decode(payload)
 		if kv := proto.FirstBytes(top, fieldKVServer); kv != nil {
-			if s.replyKV == nil {
+			if s.replyStream == nil {
 				continue
 			}
 			reply, err := s.kv.reply(kv)
 			if err == nil && reply != nil {
-				err = s.replyKV(reply)
+				err = s.replyStream(reply)
 			}
 			if err != nil {
 				s.errored = true
@@ -897,6 +996,10 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			if id, kind, path, field, ok := parseToolProgress(smFields); ok {
 				// 结束事件之后又有工具活动，撤回结束判定。
 				s.turnComplete = false
+				if field == toolGetMCPTools && len(s.mcpTools) > 0 {
+					s.markMCPDiscovery()
+					continue
+				}
 				if s.toolKind == nil {
 					s.toolKind = map[string]NativeToolKind{}
 					s.toolPath = map[string]string{}
@@ -915,6 +1018,17 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				if path != "" {
 					s.toolPath[id] = path
 				}
+				if (kind == ToolWriteFile || (kind == ToolMCP && len(s.mcpTools) > 0)) && !s.emitted[id] {
+					_, pending := s.pendingInput[id]
+					_, waiting := s.waitingToolStarts[id]
+					if !pending && !waiting {
+						if s.waitingToolStarts == nil {
+							s.waitingToolStarts = map[string]struct{}{}
+						}
+						s.waitingToolStarts[id] = struct{}{}
+						s.lastToolInput = time.Now()
+					}
+				}
 				continue
 			}
 
@@ -922,6 +1036,14 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			if id, text, ok := parseToolInputDelta(smFields); ok {
 				if text != "" {
 					s.turnComplete = false
+					if !s.emitted[id] {
+						delete(s.waitingToolStarts, id)
+						if s.pendingInput == nil {
+							s.pendingInput = map[string]struct{}{}
+						}
+						s.pendingInput[id] = struct{}{}
+						s.lastToolInput = time.Now()
+					}
 					send(StreamEvent{
 						Kind: EventToolInputDelta,
 						Text: text,
@@ -931,9 +1053,24 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				continue
 			}
 
-			// 内置工具调用：参数完整的「调用完成」帧
-			if call := parseNativeToolCall(smFields); call != nil && !s.emitted[call.ID] {
+			// 内置工具调用：收到准备好参数的 ToolCallStarted 帧。
+			if call := s.parseNativeToolCall(smFields); call != nil && !s.emitted[call.ID] {
 				s.turnComplete = false
+				delete(s.pendingInput, call.ID)
+				if call.Field == toolGetMCPTools && len(s.mcpTools) > 0 {
+					s.markMCPDiscovery()
+					continue
+				}
+				if call.Kind == ToolMCP {
+					s.mcpDiscoveryAt = time.Time{}
+				}
+				delete(s.waitingToolStarts, call.ID)
+				// 原生写入可能换 ID 重发。清理旧宣告，但保留并行的 MCP 调用。
+				for id := range s.waitingToolStarts {
+					if s.toolKind[id] == ToolWriteFile {
+						delete(s.waitingToolStarts, id)
+					}
+				}
 				if s.emitted == nil {
 					s.emitted = map[string]bool{}
 				}
@@ -952,16 +1089,28 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				send(StreamEvent{Kind: EventToolCall, Tool: call})
 				continue
 			}
+
+			if completed := proto.FirstBytes(smFields, smToolCallComplete); completed != nil && len(s.mcpTools) > 0 {
+				id := proto.FirstString(proto.Decode(completed), 1)
+				if s.toolKind[id] == ToolMCP {
+					delete(s.waitingToolStarts, id)
+				}
+			}
 		}
 
-		// 客户端动作帧只是同一次调用的摘要通知，参数不全，忽略即可。
-		if _, ok := top[fieldClientAction]; ok {
-			continue
-		}
-
-		utf := string(payload)
-		if strings.Contains(utf, `"error"`) {
-			s.emitErrorFrame(utf, send)
+		// 原生工具动作由对应的 Started 帧转发。MCP 工具发现是内部请求，
+		// 需要直接在同一条连接答复当前请求登记的工具。
+		if action := proto.FirstBytes(top, fieldClientAction); action != nil {
+			if s.replyStream != nil && len(s.mcpTools) > 0 {
+				if reply := mcpDiscoveryReply(proto.Decode(action), s.mcpTools); reply != nil {
+					if err := s.replyStream(reply); err != nil {
+						s.errored = true
+						send(StreamEvent{Kind: EventError, Message: "Cursor MCP stream: " + err.Error()})
+						return true
+					}
+					s.markMCPDiscovery()
+				}
+			}
 			continue
 		}
 
@@ -969,7 +1118,10 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 		if delta.Content != "" || delta.Thinking != "" {
 			// 结束事件之后又来内容，撤回结束判定。
 			s.turnComplete = false
+			s.lastOutput = time.Now()
 			if delta.Content != "" {
+				// 模型也可能放弃工具，改为直接回答。
+				clear(s.waitingToolStarts)
 				s.gotContent = true
 				s.textBytes += len(delta.Content)
 			}
@@ -978,6 +1130,12 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 	}
 	*buffer = b[pos:]
 	return false
+}
+
+func (s *agentStreamState) markMCPDiscovery() {
+	if !s.sawToolCall && s.mcpDiscoveryAt.IsZero() {
+		s.mcpDiscoveryAt = time.Now()
+	}
 }
 
 // trunc 截断日志里的长字符串。

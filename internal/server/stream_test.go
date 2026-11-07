@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -163,7 +164,8 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 				t.Fatalf("missing log metrics: %+v", entry)
 			}
 			if tc.disconnect {
-				if entry.Status == "ok" || entry.HTTPStatus != 499 || entry.Tokens != 0 || entry.FirstTokenMs != nil {
+				if entry.Status == "ok" || entry.HTTPStatus != 499 || entry.Tokens != 0 || entry.FirstTokenMs != nil ||
+					!strings.Contains(entry.Error, "已发起始帧，尚无输出") {
 					t.Fatalf("disconnect logged as output or success: %+v", entry)
 				}
 			} else if entry.Status != "ok" || entry.Tokens <= 0 || entry.FirstTokenMs == nil || *entry.FirstTokenMs > entry.Ms || *entry.TPS <= 0 {
@@ -185,7 +187,8 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 		response := &failOutputFlush{ResponseRecorder: httptest.NewRecorder()}
 		New().ServeHTTP(response, request)
 		entries := reqlog.List(0)
-		if !response.failed || len(entries) != 1 || entries[0].HTTPStatus != 499 || entries[0].Tokens != 0 || entries[0].FirstTokenMs != nil {
+		if !response.failed || len(entries) != 1 || entries[0].HTTPStatus != 499 || entries[0].Tokens != 0 || entries[0].FirstTokenMs != nil ||
+			!strings.Contains(entries[0].Error, "刷新") {
 			t.Fatalf("failed flush recorded as delivered: %+v", entries)
 		}
 	})
@@ -203,6 +206,89 @@ func TestRelayStartsBeforeOutputAndTracksDelivery(t *testing.T) {
 			New().ServeHTTP(response, request)
 			if response.Code != 400 || !strings.HasPrefix(response.Header().Get("Content-Type"), "application/json") {
 				t.Fatalf("%s: got status %d, type %s", path, response.Code, response.Header().Get("Content-Type"))
+			}
+		}
+	})
+
+	t.Run("long write is delivered as one tool call with bounded deltas", func(t *testing.T) {
+		t.Setenv("NATIVE_TOOL_BRIDGE", "")
+		const path = "/tmp/tool-probe.txt"
+		content := strings.Repeat("汉字🌊 quotes=\" slash=\\\n", 2000)
+		args := proto.NewWriter().Str(1, path).Str(6, content).Finish()
+		tool := proto.NewWriter().Bytes(12, proto.NewWriter().Bytes(1, args).Finish()).Finish()
+		call := proto.NewWriter().Str(1, "toolu_probe").Bytes(2, tool).Finish()
+		update := proto.NewWriter().Bytes(2, call).Finish()
+		message := proto.NewWriter().Bytes(1, update).Finish()
+		end := cursor.EncodeConnectEnvelope([]byte("{}"), false)
+		end[0] = 2
+		stream := append(cursor.EncodeConnectEnvelope(message, false), end...)
+		upstreamClient.Transport = streamTestTransport(func(r *http.Request) (*http.Response, error) {
+			_ = r.Body.Close()
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(stream))}, nil
+		})
+		const schema = `{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}`
+		for _, tc := range []struct{ route, toolDef, finish string }{
+			{"/v1/messages", `{"name":"Write","input_schema":` + schema + `}`, `"stop_reason":"tool_use"`},
+			{"/v1/chat/completions", `{"type":"function","function":{"name":"Write","parameters":` + schema + `}}`, `"finish_reason":"tool_calls"`},
+		} {
+			request := httptest.NewRequest(http.MethodPost, tc.route,
+				strings.NewReader(`{"model":"auto","stream":true,"messages":[{"role":"user","content":"write"}],"tools":[`+tc.toolDef+`]}`))
+			request.Header.Set("Authorization", "Bearer "+key)
+			response := httptest.NewRecorder()
+			New().ServeHTTP(response, request)
+			if response.Code != 200 || !strings.Contains(response.Body.String(), tc.finish) {
+				t.Fatalf("%s: expected a tool stop, got HTTP %d", tc.route, response.Code)
+			}
+			var joined strings.Builder
+			identities, fragments := 0, 0
+			for _, line := range strings.Split(response.Body.String(), "\n") {
+				if !strings.HasPrefix(line, "data: {") {
+					continue
+				}
+				if len(line) >= 64<<10 {
+					t.Fatalf("%s: SSE line has %d bytes", tc.route, len(line))
+				}
+				var event struct {
+					ContentBlock struct{ ID, Name string } `json:"content_block"`
+					Delta        struct {
+						PartialJSON string `json:"partial_json"`
+					}
+					Choices []struct {
+						Delta struct {
+							ToolCalls []struct {
+								ID       string
+								Function struct{ Name, Arguments string }
+							} `json:"tool_calls"`
+						}
+					}
+				}
+				if err := json.Unmarshal([]byte(line[len("data: "):]), &event); err != nil {
+					t.Fatal(err)
+				}
+				if event.ContentBlock.ID != "" {
+					identities++
+				}
+				part := event.Delta.PartialJSON
+				for _, choice := range event.Choices {
+					for _, tool := range choice.Delta.ToolCalls {
+						if tool.ID != "" {
+							identities++
+						}
+						part += tool.Function.Arguments
+					}
+				}
+				if part != "" {
+					fragments++
+					joined.WriteString(part)
+				}
+			}
+			var reconstructed struct {
+				FilePath string `json:"file_path"`
+				Content  string
+			}
+			err := json.Unmarshal([]byte(joined.String()), &reconstructed)
+			if err != nil || identities != 1 || fragments < 2 || reconstructed.FilePath != path || reconstructed.Content != content {
+				t.Fatalf("%s: tool identities=%d fragments=%d path=%q contentBytes=%d err=%v", tc.route, identities, fragments, reconstructed.FilePath, len(reconstructed.Content), err)
 			}
 		}
 	})

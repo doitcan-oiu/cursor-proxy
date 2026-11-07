@@ -27,12 +27,11 @@ type stage struct {
 	d    time.Duration
 }
 
-func newTimeline(label string) *timeline {
+func newTimeline(label string, startedAt time.Time) *timeline {
 	if !timingEnabled {
 		return nil
 	}
-	now := time.Now()
-	return &timeline{label: label, start: now, last: now}
+	return &timeline{label: label, start: startedAt, last: startedAt}
 }
 
 // mark 记下从上一个标记到现在的耗时。

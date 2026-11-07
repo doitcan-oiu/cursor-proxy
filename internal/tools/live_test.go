@@ -1,8 +1,9 @@
 package tools
 
-import "strings"
-
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func drain(w *LiveWriter, n *Native, chunks ...string) string {
 	var b strings.Builder
@@ -163,6 +164,28 @@ func TestLiveWriterFlushesShortContentOnFinish(t *testing.T) {
 	}
 	if !strings.Contains(got, "hi") {
 		t.Fatalf("暂存内容不能被吞掉，实际 %q", got)
+	}
+}
+
+func TestLiveWriterReconcilesCompleteContent(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, first, complete, want string
+	}{
+		{"prefix", "/tmp/hello.py", "print(", "print(1)", "```python\nprint(1)\n```\n"},
+		{"identical", "/tmp/hello.py", "print(1)", "print(1)", "```python\nprint(1)\n```\n"},
+		{"different", "/tmp/hello.py", "print(1)", "print(2)\n# tail", "```python\nprint(1)\n```\n"},
+		{"path and content arrive at finish", "", "old", "print(1)", "```python\nprint(1)\n```\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := NewLiveWriter(true)
+			n := &Native{ID: "c1", Kind: KindWriteFile, Path: tc.path}
+			first := w.Push(n, tc.first)
+			n.Path, n.Content = "/tmp/hello.py", tc.complete
+			tail, handled := w.Finish(n)
+			if got := first + tail; !handled || got != tc.want {
+				t.Fatalf("rendered = %q, want %q, handled=%t", got, tc.want, handled)
+			}
+		})
 	}
 }
 

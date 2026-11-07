@@ -205,6 +205,27 @@ func TestBuildPromptRendersToolTurnsPlainly(t *testing.T) {
 	}
 }
 
+func TestBuildPromptCorrelatesParallelToolResults(t *testing.T) {
+	got := BuildPrompt([]types.Message{
+		{Role: "assistant", ToolCalls: []types.ToolCall{
+			{ID: "first", Name: "Read", Args: `{"file_path":"/a"}`},
+			{ID: "second", Name: "Read", Args: `{"file_path":"/b"}`},
+		}},
+		{Role: "tool", ToolCallID: "second", Content: "result for /b"},
+		{Role: "tool", ToolCallID: "first", Content: "result for /a", IsError: true},
+	})
+	for _, want := range []string{
+		`called tool Read (call ID "first") with {"file_path":"/a"}`,
+		`called tool Read (call ID "second") with {"file_path":"/b"}`,
+		"Read returned (call ID \"second\"):\nresult for /b",
+		"Read failed (call ID \"first\"):\nresult for /a",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in %q", want, got)
+		}
+	}
+}
+
 // 对话以工具结果结尾时末尾没有任何指令，模型会倾向「重新开始」而不是「接着做」，
 // 表现为把刚执行过的工具再调一遍。必须补一句继续指令。
 func TestBuildPromptAsksToContinueAfterToolResult(t *testing.T) {

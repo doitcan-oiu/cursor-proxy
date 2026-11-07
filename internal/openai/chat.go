@@ -130,6 +130,7 @@ type chatBody struct {
 	Stream        bool            `json:"stream"`
 	Tools         []rawTool       `json:"tools"`
 	ToolChoice    json.RawMessage `json:"tool_choice"`
+	ParallelTools *bool           `json:"parallel_tool_calls"`
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
@@ -231,13 +232,22 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tl := newTimeline("chat " + body.Model)
-	tl.mark("读请求体")
+	tl := newTimeline("chat "+body.Model, startedAt)
+	var timingDetail string
+	defer func() { tl.done(timingDetail) }()
+	tl.mark("读请求体和解 JSON")
 
 	messages := parseMessages(body.Messages)
 	// 声明了 tools 才注入工具提示词；普通对话完全不受影响。
 	toolDefs := body.toolDefs()
-	messages = injectToolPrompt(messages, toolDefs, body.toolChoice())
+	toolChoice := body.toolChoice()
+	toolDefs = allowedToolDefinitions(toolDefs, toolChoice)
+	if len(toolDefs) == 0 && requiresTool(toolChoice) {
+		SendError(w, 400, "tool_choice requires a declared tool", "invalid_request_error", "invalid_tool_choice")
+		return
+	}
+	fileTools, promptTools := prepareFileTools(toolDefs)
+	messages = injectToolPrompt(messages, promptTools, toolChoice)
 	tl.mark("解析消息")
 
 	id := "chatcmpl-" + uuid.NewString()
@@ -249,7 +259,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	open := func() (*OpenedStream, *cursor.UpstreamError) {
-		return OpenWithFailover(ctx, messages, body.Model, ModeFor(len(toolDefs)))
+		return OpenWithFailover(ctx, messages, body.Model, ModeFor(len(toolDefs)), len(toolDefs) > 0, fileTools)
 	}
 	var opened *OpenedStream
 	var uerr *cursor.UpstreamError
@@ -266,11 +276,11 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				wire.write(sseChunk(id, body.Model, map[string]any{"role": "assistant"}, nil))
 			}
 		}
-		opened, uerr = wire.awaitOpen(startStream, open)
+		opened, uerr = wire.awaitOpen(startedAt, startStream, open)
 	} else {
 		opened, uerr = open()
 	}
-	tl.mark("取号+建流")
+	tl.markOpen(opened)
 	if uerr != nil {
 		status, message, typ, code := uerr.Status, FriendlyUpstream(uerr.Msg), "upstream_error", ""
 		switch status {
@@ -286,18 +296,21 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				SendError(w, status, message, typ, code)
 			}
 		}
+		errMsg := uerr.Msg
 		if ctx.Err() != nil {
-			status, uerr = clientClosedStatus, clientDisconnected()
+			status, errMsg = clientClosedStatus, wire.disconnectMessage()
 		}
+		timingDetail = fmt.Sprintf(" :: 输入 %d tok / 状态 %d", promptTokens, status)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Stream: body.Stream, KeyPrefix: keyPrefix,
 			Status: "error", HTTPStatus: status, Ms: time.Since(startedAt).Milliseconds(), InputTokens: promptTokens,
-			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
+			Error: trunc(errMsg, 200), Request: reqlog.SanitizeRequest(raw)})
 		return
 	}
 
 	account := opened.Account
 	defer opened.Stream.Close()
 	events := Chain(ctx, opened.Buffered, opened.Stream)
+	toolOutput := newToolOutput(toolDefs, body.ParallelTools != nil && !*body.ParallelTools, fileTools)
 
 	if body.Stream {
 		startStream()
@@ -308,12 +321,6 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		errMsg := ""
 		terminalDelivered := false
 		var content, reasoning strings.Builder
-		// 有工具时用 Scanner 边流边剥离调用标签，避免半截标签漏给客户端。
-		var scanner *tools.Scanner
-		if len(toolDefs) > 0 {
-			scanner = &tools.Scanner{}
-		}
-
 		emitText := func(text string) {
 			if text == "" {
 				return
@@ -324,7 +331,6 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var nativeCalls []tools.Call
 		truncated := false
 		gotFirst := false
 		// 纯对话（客户端没声明工具）时，把写文件调用的内容边收边吐，
@@ -348,11 +354,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				if ev.Text != "" {
 					emitText(live.Interrupt())
-					if scanner != nil {
-						emitText(scanner.Push(ev.Text))
-					} else {
-						emitText(ev.Text)
-					}
+					emitText(toolOutput.text(ev.Text))
 				}
 			case cursor.EventToolInputDelta:
 				emitText(live.Push(toNativePtr(ev.Tool), ev.Text))
@@ -361,11 +363,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					emitText(s)
 					continue
 				}
-				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
-					nativeCalls = append(nativeCalls, c)
-				} else {
-					emitText(tools.NativeToText(toNative(ev.Tool)))
-				}
+				emitText(toolOutput.native(ev.Tool))
 			case cursor.EventEnd:
 				truncated = ev.Truncated
 			case cursor.EventError:
@@ -385,21 +383,28 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if truncated {
 			finish = "length"
 		}
-		calls := nativeCalls
-		if scanner != nil && !errored && !wire.disconnected() {
-			emitText(scanner.Flush())
-			// 上游原生调用优先；模型自己按文本协议写的作为补充
-			calls = append(calls, scanner.Calls()...)
+		if !errored && !wire.disconnected() {
+			emitText(toolOutput.flush())
+			if message, code := toolOutput.completionError(toolChoice, truncated); message != "" {
+				errored, errMsg = true, message
+				terminalDelivered = wire.write(chatStreamError(errMsg, "upstream_error", code))
+			}
 		}
+		calls := toolOutput.calls
 		var deliveredCalls []tools.Call
 		if len(calls) > 0 && !errored && !wire.disconnected() {
 			for i, c := range calls {
-				if !wire.write(sseChunk(id, body.Model, map[string]any{
-					"tool_calls": []map[string]any{toolCallDelta(i, c)},
-				}, nil)) {
+				if !writeToolArgs(c.Arguments, func(first bool, part string) bool {
+					if !wire.write(sseChunk(id, body.Model, map[string]any{
+						"tool_calls": []map[string]any{toolCallDelta(i, c, first, part)},
+					}, nil)) {
+						return false
+					}
+					wire.markOutput()
+					return true
+				}) {
 					break
 				}
-				wire.markOutput()
 				deliveredCalls = append(deliveredCalls, c)
 			}
 			finish = "tool_calls"
@@ -432,7 +437,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		httpStatus := 0
 		if !terminalDelivered && wire.disconnected() {
-			outcome, errored, errMsg, httpStatus = cursor.OutcomeCanceled, true, clientDisconnected().Msg, clientClosedStatus
+			outcome, errored, errMsg, httpStatus = cursor.OutcomeCanceled, true, wire.disconnectMessage(), clientClosedStatus
 		}
 		cursor.ReleaseAccount(account.ID, outcome, errMsg)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
@@ -440,8 +445,8 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			HTTPStatus: httpStatus, InputTokens: promptTokens, FirstTokenMs: wire.firstTokenMs(startedAt),
 			Chars: utf8.RuneCountInString(content.String()), Tokens: completionTokens,
 			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
-		tl.done(fmt.Sprintf(" :: 提示 %d tok / 输出 %d tok / %d 字",
-			promptTokens, completionTokens, utf8.RuneCountInString(content.String())))
+		timingDetail = fmt.Sprintf(" :: 提示 %d tok / 输出 %d tok / %d 字",
+			promptTokens, completionTokens, utf8.RuneCountInString(content.String()))
 		return
 	}
 
@@ -449,18 +454,13 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	reasoning := ""
 	lastError := ""
 	truncated := false
-	var toolCalls []tools.Call
 	for ev := range events {
 		switch ev.Kind {
 		case cursor.EventDelta:
-			content += ev.Text
+			content += toolOutput.text(ev.Text)
 			reasoning += ev.Thinking
 		case cursor.EventToolCall:
-			if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
-				toolCalls = append(toolCalls, c)
-			} else {
-				content += tools.NativeToText(toNative(ev.Tool))
-			}
+			content += toolOutput.native(ev.Tool)
 		case cursor.EventEnd:
 			truncated = ev.Truncated
 		case cursor.EventError:
@@ -475,13 +475,12 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(toolDefs) > 0 {
-		var scanner tools.Scanner
-		content = scanner.Push(content) + scanner.Flush()
-		toolCalls = append(toolCalls, scanner.Calls()...)
+	content += toolOutput.flush()
+	toolCalls := toolOutput.calls
+	if lastError == "" {
+		lastError, _ = toolOutput.completionError(toolChoice, truncated)
 	}
-
-	if content == "" && len(toolCalls) == 0 && lastError != "" {
+	if lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: false, Status: "error", HTTPStatus: 502, Ms: time.Since(startedAt).Milliseconds(), InputTokens: promptTokens,
@@ -562,6 +561,7 @@ func toNative(c *cursor.NativeToolCall) tools.Native {
 	return tools.Native{
 		ID: c.ID, Kind: tools.NativeKind(c.Kind), Path: c.Path, Command: c.Command,
 		Pattern: c.Pattern, Content: c.Content, Prompt: c.Prompt,
+		Glob: c.Glob, OutputMode: c.OutputMode, Offset: c.Offset, Limit: c.Limit,
 		URL: c.URL, Description: c.Description, Field: c.Field,
 		Name: c.Name, Todos: todos,
 	}
@@ -575,25 +575,136 @@ func mapNativeCall(c *cursor.NativeToolCall, defs []tools.Definition) (tools.Cal
 	return tools.MapNative(toNative(c), defs)
 }
 
-// toolCallDelta 组装流式响应里的单个 tool_call 增量。
-// 我们只在标签闭合后才识别出完整调用，所以一次性给全 id/name/arguments。
-func toolCallDelta(index int, c tools.Call) map[string]any {
-	return map[string]any{
-		"index":    index,
-		"id":       c.ID,
-		"type":     "function",
-		"function": map[string]any{"name": c.Name, "arguments": c.Arguments},
+func allowedToolDefinitions(defs []tools.Definition, choice tools.Choice) []tools.Definition {
+	switch choice.Mode {
+	case "none":
+		return nil
+	case "function":
+		for _, def := range defs {
+			if def.Name == choice.Name {
+				return []tools.Definition{def}
+			}
+		}
+		return nil
+	default:
+		return defs
 	}
+}
+
+const missingToolCall = "上游未返回 tool_choice 要求的工具调用"
+
+func requiresTool(choice tools.Choice) bool {
+	return choice.Mode == "function" || choice.Mode == "required"
+}
+
+// toolOutput 按上游出现的顺序收集原生调用和文本调用。
+type toolOutput struct {
+	defs             []tools.Definition
+	fileTools        fileToolBridge
+	single           bool
+	mixedFileTools   bool
+	unsafeNativeEdit bool
+	scanner          *tools.Scanner
+	calls            []tools.Call
+}
+
+func newToolOutput(defs []tools.Definition, single bool, fileTools fileToolBridge) *toolOutput {
+	out := &toolOutput{defs: defs, single: single, fileTools: fileTools, mixedFileTools: tools.FileToolsNeedDistinctCalls(defs)}
+	if len(defs) > 0 {
+		out.scanner = tools.NewScanner(func(call tools.Call) bool {
+			for _, def := range defs {
+				if def.Name == call.Name {
+					out.add(call)
+					return true
+				}
+			}
+			return false
+		})
+	}
+	return out
+}
+
+func (o *toolOutput) add(call tools.Call) {
+	if !o.single || len(o.calls) == 0 {
+		o.calls = append(o.calls, call)
+	}
+}
+
+func (o *toolOutput) text(s string) string {
+	if o.scanner == nil {
+		return s
+	}
+	return o.scanner.Push(s)
+}
+
+func (o *toolOutput) native(call *cursor.NativeToolCall) string {
+	if call != nil && call.Kind == cursor.ToolMCP {
+		if mapped, ok := o.fileTools.mapCall(call); ok {
+			o.add(mapped)
+		}
+		return ""
+	}
+	if call != nil && call.Kind == cursor.ToolWriteFile && o.mixedFileTools {
+		o.unsafeNativeEdit = true
+		return ""
+	}
+	if mapped, ok := mapNativeCall(call, o.defs); ok {
+		o.add(mapped)
+		return ""
+	}
+	return tools.NativeToText(toNative(call))
+}
+
+func (o *toolOutput) completionError(choice tools.Choice, truncated bool) (string, string) {
+	if truncated || len(o.calls) > 0 {
+		return "", ""
+	}
+	if o.unsafeNativeEdit {
+		return "上游文件操作缺少整文件写入或局部替换的区分，未执行", "ambiguous_file_operation"
+	}
+	if requiresTool(choice) {
+		return missingToolCall, "tool_choice_not_satisfied"
+	}
+	return "", ""
+}
+
+func (o *toolOutput) flush() string {
+	if o.scanner == nil {
+		return ""
+	}
+	return o.scanner.Flush()
+}
+
+// toolCallDelta 在首个片段发送工具身份，后续片段仅补充参数。
+func toolCallDelta(index int, c tools.Call, first bool, part string) map[string]any {
+	function := map[string]any{"arguments": part}
+	delta := map[string]any{"index": index, "function": function}
+	if first {
+		delta["id"] = c.ID
+		delta["type"] = "function"
+		function["name"] = c.Name
+	}
+	return delta
 }
 
 // injectToolPrompt 把工具说明并入 system 提示，并在最后一条用户消息末尾附一句提醒。
 // 没有工具时原样返回，保证普通对话的行为完全不变。
 //
-// 只为「上游没有内置对应物」的自定义工具注入。读文件、跑命令这类工具上游本来就有，
-// 走原生桥接更可靠；再额外注入一套 <tool_call> 文本协议只会适得其反——模型会把
-// 这段额外的系统提示连同历史一起当成伪造上下文，明确拒绝采用，然后反复重试同一个工具。
+// 只给自定义工具注入 <tool_call> 协议；原生工具走桥接，只有显式要求调用工具时才补充提示。
 func injectToolPrompt(messages []types.Message, defs []tools.Definition, choice tools.Choice) []types.Message {
 	prompt := tools.BuildSystemPrompt(tools.WithoutNativeEquivalent(defs), choice)
+	reminder := ""
+	if prompt != "" {
+		reminder = tools.Reminder()
+	} else if len(defs) > 0 && choice.Mode == "function" {
+		prompt = fmt.Sprintf("For the current turn, use the built-in tool corresponding to the client's %q tool. Provide the tool call, not just a description of the action.", choice.Name)
+	} else if len(defs) > 0 && choice.Mode == "required" {
+		names := make([]string, 0, len(defs))
+		for _, def := range defs {
+			names = append(names, def.Name)
+		}
+		prompt = "For the current turn, make at least one built-in tool call corresponding to a tool available to the client: " + strings.Join(names, ", ") + "."
+	}
 	if prompt == "" {
 		return messages
 	}
@@ -619,7 +730,7 @@ func injectToolPrompt(messages []types.Message, defs []tools.Definition, choice 
 	// 末尾提醒：靠近生成点，压过上游自身 agent 提示词的影响
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i].Role == "user" {
-			out[i].Content = types.ContentToText(out[i].Content) + tools.Reminder()
+			out[i].Content = types.ContentToText(out[i].Content) + reminder
 			break
 		}
 	}

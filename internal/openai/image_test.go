@@ -121,6 +121,21 @@ func TestAnthropicBlocksToImagesRecursesToolResult(t *testing.T) {
 	}
 }
 
+func TestAnthropicToolResultsPrecedeFollowupWithoutDuplicatingImages(t *testing.T) {
+	msg := anthropicMessage{Role: "user", Content: json.RawMessage(`[
+		{"type":"tool_result","tool_use_id":"a","content":[{"type":"text","text":"result A"},
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + base64PNG(t) + `"}}]},
+		{"type":"tool_result","tool_use_id":"b","content":"result B"},
+		{"type":"text","text":"Compare both results."}
+	]`)}
+	got := splitAnthropicMessage(msg)
+	if len(got) != 3 || got[0].Role != "tool" || got[0].ToolCallID != "a" || len(got[0].Images) != 1 ||
+		got[1].Role != "tool" || got[1].ToolCallID != "b" || got[2].Role != "user" ||
+		got[2].Content != "Compare both results." || len(got[2].Images) != 0 {
+		t.Fatalf("tool results and follow-up were decoded incorrectly: %+v", got)
+	}
+}
+
 func base64PNG(t *testing.T) string {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, 3, 3))

@@ -58,6 +58,10 @@ type Native struct {
 	Path        string
 	Command     string
 	Pattern     string
+	Glob        string
+	OutputMode  string
+	Offset      int32
+	Limit       uint32
 	Content     string
 	Prompt      string
 	URL         string
@@ -81,7 +85,7 @@ type TodoItem struct {
 var candidateNames = map[NativeKind][]string{
 	KindReadFile: {
 		"read", "read_file", "readfile", "view", "view_file",
-		"cat", "open_file", "get_file", "str_replace_editor",
+		"cat", "open_file", "get_file",
 	},
 	KindRunTerminal: {
 		"bash", "shell", "run_terminal_cmd", "run_command", "execute_command",
@@ -97,7 +101,7 @@ var candidateNames = map[NativeKind][]string{
 		"web_search", "websearch", "search_web", "google", "bing", "brave_search",
 	},
 	KindWriteFile: {
-		"write", "write_file", "create_file", "edit", "str_replace_editor", "apply_patch",
+		"write", "write_file", "create_file",
 	},
 	KindTask: {
 		"task", "agent", "subagent", "dispatch_agent", "delegate",
@@ -121,7 +125,7 @@ var candidateParams = map[NativeKind][]string{
 	KindReadFile:    {"filePath", "file_path", "path", "target_file", "filename", "file"},
 	KindRunTerminal: {"command", "cmd", "script", "shell_command"},
 	KindSearchFiles: {"pattern", "query", "regex", "search_term", "q"},
-	KindGlob:        {"pattern", "glob", "globPattern", "query", "path"},
+	KindGlob:        {"pattern", "glob", "globPattern", "query"},
 	KindWebSearch:   {"query", "search_term", "q", "search", "keywords"},
 	KindWriteFile:   {"filePath", "file_path", "path", "target_file", "filename", "file"},
 	KindTask:        {"prompt", "task", "instructions", "input", "message"},
@@ -253,6 +257,9 @@ func MapNative(n Native, defs []Definition) (Call, bool) {
 	if n.Kind == KindUnknown || n.Kind == KindAwait || n.Kind == KindAskQuestion {
 		return Call{}, false
 	}
+	if n.Kind == KindWriteFile && FileToolsNeedDistinctCalls(defs) {
+		return Call{}, false
+	}
 	def, ok := matchTool(n.Kind, defs)
 	if !ok {
 		return Call{}, false
@@ -291,18 +298,48 @@ func MapNative(n Native, defs []Definition) (Call, bool) {
 			args["content"] = n.Content
 		}
 	}
+	switch n.Kind {
+	case KindReadFile:
+		if n.Offset != 0 {
+			setNativeParam(args, def, n.Offset, "offset", "start_line")
+		}
+		if n.Limit != 0 {
+			setNativeParam(args, def, n.Limit, "limit", "line_count")
+		}
+	case KindRunTerminal:
+		if n.Path != "" {
+			setNativeParam(args, def, n.Path, "workdir", "cwd", "working_directory")
+		}
+	case KindSearchFiles, KindGlob:
+		if n.Path != "" {
+			setNativeParam(args, def, n.Path, "path", "directory", "target_directory", "dir")
+		}
+		if n.Glob != "" {
+			setNativeParam(args, def, n.Glob, "glob", "include")
+		}
+		if n.OutputMode != "" {
+			setNativeParam(args, def, n.OutputMode, "output_mode")
+		}
+	case KindFetchURL:
+		if schemaRequires(def, "prompt") {
+			setNativeParam(args, def, "Return the main content of this page.", "prompt")
+		}
+	}
 	// 部分客户端（如 OpenCode 的 bash / task）要求必填 description
-	if schemaRequires(def, "description") {
+	if n.Description != "" || schemaRequires(def, "description") {
 		desc := n.Description
 		if desc == "" {
 			desc = defaultDescription(n.Kind)
 		}
-		args["description"] = desc
+		setNativeParam(args, def, desc, "description")
 	}
 	// task 工具通常还要指定子 agent 类型
 	if n.Kind == KindTask {
-		if key, ok := matchNamedParam(def, "subagent_type", "subagentType", "agent", "agent_type"); ok {
+		if key, ok := matchNamedParam(def, "subagent_type", "subagentType", "agent", "agent_type"); ok && schemaRequires(def, key) {
 			args[key] = "general"
+			if def.Name == "Agent" || def.Name == "Task" {
+				args[key] = "general-purpose"
+			}
 		}
 	}
 
@@ -321,15 +358,15 @@ func MapNative(n Native, defs []Definition) (Call, bool) {
 func matchTool(kind NativeKind, defs []Definition) (Definition, bool) {
 	for _, want := range candidateNames[kind] {
 		for _, d := range defs {
-			if strings.EqualFold(d.Name, want) {
+			if strings.EqualFold(d.Name, want) && matchesNativeParams(kind, d) {
 				return d, true
 			}
 		}
 	}
-	// 退一步做包含匹配，兼容带前缀的工具名（如 mcp_xxx_bash）
+	// MCP 工具名只有在末段恰好是支持的工具名时才参与匹配。
 	for _, want := range candidateNames[kind] {
 		for _, d := range defs {
-			if strings.Contains(strings.ToLower(d.Name), want) {
+			if name := mcpToolName(d.Name); strings.EqualFold(name, want) && matchesNativeParams(kind, d) {
 				return d, true
 			}
 		}
@@ -337,16 +374,31 @@ func matchTool(kind NativeKind, defs []Definition) (Definition, bool) {
 	return Definition{}, false
 }
 
-func matchParam(kind NativeKind, def Definition) (string, bool) {
-	props := schemaProperties(def)
-	for _, want := range candidateParams[kind] {
-		for name := range props {
-			if strings.EqualFold(name, want) {
-				return name, true
-			}
+func mcpToolName(name string) string {
+	if rest, ok := strings.CutPrefix(name, "mcp__"); ok {
+		if server, tool, ok := strings.Cut(rest, "__"); ok && server != "" {
+			return tool
 		}
 	}
-	return "", false
+	return ""
+}
+
+func matchesNativeParams(kind NativeKind, def Definition) bool {
+	if len(def.Parameters) == 0 {
+		return true
+	}
+	if _, ok := matchParam(kind, def); !ok {
+		return false
+	}
+	if kind == KindWriteFile {
+		_, ok := matchContentParam(def)
+		return ok
+	}
+	return true
+}
+
+func matchParam(kind NativeKind, def Definition) (string, bool) {
+	return matchNamedParam(def, candidateParams[kind]...)
 }
 
 func defaultDescription(kind NativeKind) string {
@@ -372,17 +424,15 @@ func matchNamedParam(def Definition, wants ...string) (string, bool) {
 	return "", false
 }
 
+func setNativeParam(args map[string]any, def Definition, value any, wants ...string) {
+	if name, ok := matchNamedParam(def, wants...); ok {
+		args[name] = value
+	}
+}
+
 // matchContentParam 找出写文件工具里承载文件内容的属性。
 func matchContentParam(def Definition) (string, bool) {
-	props := schemaProperties(def)
-	for _, want := range []string{"content", "contents", "text", "new_string", "code_edit", "body"} {
-		for name := range props {
-			if strings.EqualFold(name, want) {
-				return name, true
-			}
-		}
-	}
-	return "", false
+	return matchNamedParam(def, "content", "contents", "text", "body")
 }
 
 func fallbackParam(kind NativeKind) string {
@@ -518,21 +568,69 @@ func WithoutNativeEquivalent(defs []Definition) []Definition {
 	if !NativeBridgeEnabled() {
 		return defs
 	}
+	mixedFileTools := FileToolsNeedDistinctCalls(defs)
 	out := make([]Definition, 0, len(defs))
 	for _, d := range defs {
-		if !hasNativeEquivalent(d.Name) {
+		if (mixedFileTools && isNativeWriteTool(d)) || !hasNativeEquivalent(d) {
 			out = append(out, d)
 		}
 	}
 	return out
 }
 
-func hasNativeEquivalent(name string) bool {
-	for _, names := range candidateNames {
-		for _, want := range names {
-			if strings.EqualFold(name, want) {
-				return true
-			}
+// FileToolsNeedDistinctCalls 表示两类文件操作同时可用，不能把 Cursor 的 EditArgs
+// 当作完整写入。这个上游结构同时承载了整文件内容和局部替换片段。
+func FileToolsNeedDistinctCalls(defs []Definition) bool {
+	var write, edit bool
+	for _, d := range defs {
+		write = write || isNativeWriteTool(d)
+		edit = edit || isPartialEditTool(d)
+	}
+	return write && edit
+}
+
+// ClientFileToolDefinitions selects tools that need a distinct identity upstream.
+func ClientFileToolDefinitions(defs []Definition) []Definition {
+	if !NativeBridgeEnabled() {
+		return nil
+	}
+	mixedEdits := FileToolsNeedDistinctCalls(defs)
+	var selected []Definition
+	for _, d := range defs {
+		if _, list := matchTool(KindListFiles, []Definition{d}); list || isPartialEditTool(d) || (mixedEdits && isNativeWriteTool(d)) {
+			selected = append(selected, d)
+		}
+	}
+	return selected
+}
+
+func isPartialEditTool(def Definition) bool {
+	name := def.Name
+	if tool := mcpToolName(name); tool != "" {
+		name = tool
+	}
+	switch strings.ToLower(name) {
+	case "edit", "edit_file", "multiedit", "multi_edit", "notebookedit", "notebook_edit",
+		"str_replace_editor", "str_replace", "strreplace", "apply_patch", "applypatch", "apply_diff", "replace_in_file":
+		return true
+	}
+	return false
+}
+
+func isNativeWriteTool(def Definition) bool {
+	_, ok := matchTool(KindWriteFile, []Definition{def})
+	return ok
+}
+
+func hasNativeEquivalent(def Definition) bool {
+	for kind := range candidateNames {
+		// 部分上游模型没有启用原生 ls，仍把目录列表工具告知模型。
+		// 如果上游支持并发出 ls 调用，MapNative 依然可以桥接。
+		if kind == KindListFiles {
+			continue
+		}
+		if _, ok := matchTool(kind, []Definition{def}); ok {
+			return true
 		}
 	}
 	return false

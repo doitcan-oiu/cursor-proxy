@@ -13,9 +13,8 @@ type LiveWriter struct {
 	enabled bool
 	// activeID 是当前正在流式输出的调用；空表示没有进行中的输出。
 	activeID string
-	// pending 是还没决定用什么围栏时暂存的内容。
-	// 上游的「进行中」帧有时先到、路径却还是空的，等一小段内容再判断更准。
-	pending string
+	// input 保存已收到的片段，用于确定围栏和核对完成帧的正文前缀。
+	input strings.Builder
 	// decided 表示围栏已经确定，后续片段可以直接透传。
 	decided bool
 	// chunks 是定下围栏前收到的片段数。
@@ -53,13 +52,13 @@ func (w *LiveWriter) Push(n *Native, text string) string {
 		out.WriteString(w.closeActive())
 		w.activeID = n.ID
 	}
+	w.input.WriteString(text)
 
 	if !w.decided {
-		w.pending += text
 		w.chunks++
 		// 路径一到就能准确判断。上游的路径帧总是紧跟在第一个内容片段之后，
 		// 所以多攒一个片段就能等到它；等不到再靠内容猜，别让开头一直卡着。
-		if n.Path == "" && w.chunks < 2 && len(w.pending) < sniffAfter {
+		if n.Path == "" && w.chunks < 2 && w.input.Len() < sniffAfter {
 			return out.String()
 		}
 		out.WriteString(w.decide(n.Path))
@@ -74,12 +73,11 @@ func (w *LiveWriter) Push(n *Native, text string) string {
 // decide 定下围栏并把暂存内容一次吐出。
 func (w *LiveWriter) decide(path string) string {
 	w.decided = true
-	body := w.pending
-	w.pending = ""
+	body := w.input.String()
 
 	var open string
 	if path != "" {
-		open, w.close = fenceFor(path, "")
+		open, w.close = fenceFor(path, body)
 	} else {
 		open, w.close = sniffFence(body)
 	}
@@ -101,7 +99,19 @@ func (w *LiveWriter) Finish(n *Native) (text string, handled bool) {
 	if !w.enabled || n == nil || w.activeID == "" || w.activeID != n.ID {
 		return "", false
 	}
-	return w.closeActive(), true
+	if !w.decided {
+		// 还没对下游发送正文时，可直接采用完整内容和后到的路径。
+		if n.Content != "" {
+			w.input.Reset()
+			w.input.WriteString(n.Content)
+		}
+		text = w.decide(n.Path)
+	} else if suffix, ok := strings.CutPrefix(n.Content, w.input.String()); ok {
+		// 已经流出的内容只在确实是完整内容的前缀时续写。
+		text = suffix
+		w.mark(suffix)
+	}
+	return text + w.closeActive(), true
 }
 
 // Interrupt 在有正文插入或流结束时收尾未闭合的代码块，
@@ -119,12 +129,13 @@ func (w *LiveWriter) closeActive() string {
 	}
 	var out string
 	// 内容太短、还没定下围栏就结束了，此刻按已有内容决定
-	if !w.decided && w.pending != "" {
+	if !w.decided && w.input.Len() > 0 {
 		out = w.decide("")
 	}
 
 	wrote, close := w.wrote, w.close
-	w.activeID, w.decided, w.pending, w.chunks = "", false, "", 0
+	w.activeID, w.decided, w.chunks = "", false, 0
+	w.input.Reset()
 	w.wrote, w.close = false, ""
 
 	switch {

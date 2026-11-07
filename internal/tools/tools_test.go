@@ -71,6 +71,23 @@ func TestScannerHandlesTagSplitAcrossChunks(t *testing.T) {
 	}
 }
 
+func TestScannerKeepsClosingTagsInsideLongWriteArguments(t *testing.T) {
+	content := strings.Repeat(`写入 </tool_call> \"quoted\" \\ `, 4096)
+	args := `{"file_path":"a.txt","content":"` + content + `"}`
+	in := "前文" + OpenTag + `{"name":"Write","arguments":` + args + `}` + CloseTag + "后文"
+	var scanner Scanner
+	var text strings.Builder
+	// 刻意在单字节处切分，覆盖转义符和真实闭合标签跨增量的情况。
+	for i := range len(in) {
+		text.WriteString(scanner.Push(in[i : i+1]))
+	}
+	text.WriteString(scanner.Flush())
+	calls := scanner.Calls()
+	if text.String() != "前文后文" || len(calls) != 1 || calls[0].Name != "Write" || calls[0].Arguments != args {
+		t.Fatalf("应完整解析长 Write 调用，正文 %d 字节，调用数 %d", text.Len(), len(calls))
+	}
+}
+
 func TestScannerExtractsMultipleCalls(t *testing.T) {
 	in := OpenTag + `{"name":"a","arguments":{}}` + CloseTag +
 		"中间" + OpenTag + `{"name":"b","arguments":{"x":1}}` + CloseTag
@@ -129,6 +146,18 @@ func TestParseCallRejectsGarbage(t *testing.T) {
 		if _, ok := ParseCall(body); ok {
 			t.Errorf("不应解析成功: %q", body)
 		}
+	}
+}
+
+func TestScannerPreservesMalformedOrNonObjectArguments(t *testing.T) {
+	for _, args := range []string{`null`, `[]`, `42`, `""`, `"[]"`, `"{broken}"`, `"unterminated`} {
+		t.Run(args, func(t *testing.T) {
+			in := OpenTag + `{"name":"Write","arguments":` + args + `}` + CloseTag
+			text, calls := scanAll([]string{in})
+			if len(calls) != 0 || text != in {
+				t.Fatalf("非法参数应保留为原文，得到正文 %q，调用 %+v", text, calls)
+			}
+		})
 	}
 }
 

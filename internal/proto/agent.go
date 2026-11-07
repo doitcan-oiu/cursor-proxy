@@ -41,6 +41,7 @@ func BuildPrompt(messages []types.Message) string {
 	}
 
 	endsWithResult := false
+	var toolNames map[string]string
 	for _, m := range messages {
 		content := strings.TrimSpace(types.ContentToText(m.Content))
 		endsWithResult = m.Role == "tool"
@@ -49,8 +50,19 @@ func BuildPrompt(messages []types.Message) string {
 			// 系统提示直接作为正文开头，不加角色前缀
 			write(content)
 		case "assistant":
+			for _, call := range m.ToolCalls {
+				if call.ID != "" {
+					if toolNames == nil {
+						toolNames = make(map[string]string)
+					}
+					toolNames[call.ID] = call.Name
+				}
+			}
 			write(joinNonEmpty(content, describeCalls(m.ToolCalls)))
 		case "tool":
+			if m.ToolName == "" {
+				m.ToolName = toolNames[m.ToolCallID]
+			}
 			write(describeResult(m, content))
 		default:
 			if content != "" {
@@ -84,6 +96,9 @@ func describeCalls(calls []types.ToolCall) string {
 		}
 		b.WriteString("assistant: called tool ")
 		b.WriteString(c.Name)
+		if c.ID != "" {
+			fmt.Fprintf(&b, " (call ID %q)", c.ID)
+		}
 		if args := strings.TrimSpace(c.Args); args != "" && args != "{}" {
 			b.WriteString(" with ")
 			b.WriteString(args)
@@ -103,10 +118,14 @@ func describeResult(m types.Message, content string) string {
 	if m.IsError {
 		verb = "failed"
 	}
-	if content == "" {
-		return name + " " + verb + " (no output)"
+	result := name + " " + verb
+	if m.ToolCallID != "" {
+		result += fmt.Sprintf(" (call ID %q)", m.ToolCallID)
 	}
-	return name + " " + verb + ":\n" + content
+	if content == "" {
+		return result + " (no output)"
+	}
+	return result + ":\n" + content
 }
 
 func joinNonEmpty(parts ...string) string {
@@ -183,6 +202,11 @@ const (
 
 // EncodeAgentRequest 构造 agentn.api5 的 AgentClientMessage/AgentRunRequest（未加 Connect 信封）。
 func EncodeAgentRequest(messages []types.Message, modelID string, mode Mode) []byte {
+	return EncodeAgentRequestWithMCP(messages, modelID, mode, nil, "")
+}
+
+// EncodeAgentRequestWithMCP registers client tools and appends a system prompt for this run.
+func EncodeAgentRequestWithMCP(messages []types.Message, modelID string, mode Mode, tools []MCPTool, systemPrompt string) []byte {
 	userMsg := NewWriter()
 	userMsg.Str(1, BuildPrompt(messages))
 	userMsg.Str(2, uuid.NewString())
@@ -216,8 +240,11 @@ func EncodeAgentRequest(messages []types.Message, modelID string, mode Mode) []b
 	runReq.Str(1, "")
 	runReq.Bytes(2, convAction.Finish())
 	runReq.Bytes(3, model.Finish())
-	runReq.Str(4, "")
+	runReq.Bytes(4, encodeMCPTools(tools))
 	runReq.Str(5, uuid.NewString())
+	if systemPrompt != "" {
+		runReq.Bytes(29, NewWriter().Str(2, systemPrompt).Finish())
+	}
 
 	clientMsg := NewWriter()
 	clientMsg.Bytes(1, runReq.Finish())

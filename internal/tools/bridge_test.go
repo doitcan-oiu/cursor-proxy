@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -18,6 +19,152 @@ var openCodeTools = []Definition{
 		Description: "Run a shell command",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command","description"]}`),
 	},
+}
+
+func TestNativeToolContracts(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		native Native
+		schema string
+		want   string
+	}{
+		{
+			name: "Read", native: Native{Kind: KindReadFile, Path: "/tmp/a.txt", Offset: 2, Limit: 5},
+			schema: `{"properties":{"file_path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["file_path"]}`,
+			want:   `{"file_path":"/tmp/a.txt","offset":2,"limit":5}`,
+		},
+		{
+			name: "mcp__workspace__read", native: Native{Kind: KindReadFile, Path: "/tmp/a.txt"},
+			schema: `{"properties":{"filePath":{"type":"string"}},"required":["filePath"]}`,
+			want:   `{"filePath":"/tmp/a.txt"}`,
+		},
+		{
+			name: "Bash", native: Native{Kind: KindRunTerminal, Command: "pwd", Path: "/tmp/project", Description: "Show directory"},
+			schema: `{"properties":{"command":{"type":"string"},"workdir":{"type":"string"},"description":{"type":"string"}},"required":["command","description"]}`,
+			want:   `{"command":"pwd","workdir":"/tmp/project","description":"Show directory"}`,
+		},
+		{
+			name: "Grep", native: Native{Kind: KindSearchFiles, Pattern: "^func", Path: "/tmp/project", Glob: "*.go", OutputMode: "content"},
+			schema: `{"properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"output_mode":{"type":"string"}},"required":["pattern"]}`,
+			want:   `{"pattern":"^func","path":"/tmp/project","glob":"*.go","output_mode":"content"}`,
+		},
+		{
+			name: "Glob", native: Native{Kind: KindGlob, Pattern: "**/*.go", Path: "/tmp/project"},
+			schema: `{"properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}`,
+			want:   `{"pattern":"**/*.go","path":"/tmp/project"}`,
+		},
+		{
+			name: "WebSearch", native: Native{Kind: KindWebSearch, Pattern: "Go HTTP server"},
+			schema: `{"properties":{"query":{"type":"string"}},"required":["query"]}`,
+			want:   `{"query":"Go HTTP server"}`,
+		},
+		{
+			name: "create_file", native: Native{Kind: KindWriteFile, Path: "/tmp/a.txt", Content: "第一行\n"},
+			schema: `{"properties":{"path":{"type":"string"},"contents":{"type":"string"}},"required":["path","contents"]}`,
+			want:   `{"path":"/tmp/a.txt","contents":"第一行\n"}`,
+		},
+		{
+			name: "Agent", native: Native{Kind: KindTask, Prompt: "Review project", Description: "Review Go project"},
+			schema: `{"properties":{"prompt":{"type":"string"},"description":{"type":"string"},"subagent_type":{"type":"string"}},"required":["description","prompt"]}`,
+			want:   `{"prompt":"Review project","description":"Review Go project"}`,
+		},
+		{
+			name: "rm", native: Native{Kind: KindDeleteFile, Path: "/tmp/a.txt"},
+			schema: `{"properties":{"filename":{"type":"string"}},"required":["filename"]}`,
+			want:   `{"filename":"/tmp/a.txt"}`,
+		},
+		{
+			name: "list_dir", native: Native{Kind: KindListFiles, Path: "/tmp/project"},
+			schema: `{"properties":{"directory":{"type":"string"}},"required":["directory"]}`,
+			want:   `{"directory":"/tmp/project"}`,
+		},
+		{
+			name: "read_url", native: Native{Kind: KindFetchURL, URL: "https://example.com/guide"},
+			schema: `{"properties":{"uri":{"type":"string"}},"required":["uri"]}`,
+			want:   `{"uri":"https://example.com/guide"}`,
+		},
+		{
+			name: "update_plan", native: Native{Kind: KindUpdateTodos},
+			schema: `{"properties":{"plan":{"type":"array","items":{"type":"object"}}},"required":["plan"]}`,
+			want:   `{"plan":[]}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.native.ID = "toolu_contract"
+			def := Definition{Name: tc.name, Parameters: json.RawMessage(tc.schema)}
+			call, ok := MapNative(tc.native, []Definition{def})
+			if !ok || call.ID != tc.native.ID || call.Name != tc.name {
+				t.Fatalf("unexpected call: %+v, mapped=%t", call, ok)
+			}
+			var got, want map[string]any
+			if err := json.Unmarshal([]byte(call.Arguments), &got); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("arguments = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestNativeWriteDoesNotClaimIncompatibleTools(t *testing.T) {
+	t.Setenv("NATIVE_TOOL_BRIDGE", "on")
+	for _, def := range []Definition{
+		{Name: "Edit"},
+		{Name: "str_replace_editor"},
+		{Name: "apply_patch"},
+		{Name: "overwrite_invoice"},
+		{Name: "mcp__workspace__apply_patch"},
+		{Name: "Write", Parameters: json.RawMessage(`{"properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["file_path","old_string","new_string"]}`)},
+	} {
+		t.Run(def.Name, func(t *testing.T) {
+			defs := []Definition{def}
+			if call, ok := MapNative(Native{Kind: KindWriteFile, Path: "/tmp/a.txt", Content: "text"}, defs); ok {
+				t.Fatalf("native Write must not invoke %q: %+v", def.Name, call)
+			}
+			if kept := WithoutNativeEquivalent(defs); len(kept) != 1 || kept[0].Name != def.Name {
+				t.Fatalf("custom tool %q should remain available: %v", def.Name, kept)
+			}
+		})
+	}
+}
+
+func TestNativeFetchSuppliesRequiredPrompt(t *testing.T) {
+	def := Definition{
+		Name:       "WebFetch",
+		Parameters: json.RawMessage(`{"properties":{"url":{"type":"string"},"prompt":{"type":"string"}},"required":["url","prompt"]}`),
+	}
+	url := "https://example.com/guide"
+	call, ok := MapNative(Native{Kind: KindFetchURL, URL: url}, []Definition{def})
+	var args map[string]string
+	if !ok || json.Unmarshal([]byte(call.Arguments), &args) != nil || args["url"] != url || strings.TrimSpace(args["prompt"]) == "" {
+		t.Fatalf("WebFetch requires a URL and prompt: %+v", call)
+	}
+}
+
+func TestNativeToolsWithoutBridgeRemainText(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind NativeKind
+		want string
+	}{
+		{"ask_question", KindAskQuestion, "probe-detail"},
+		{"await", KindAwait, "等待后台任务"},
+		{"generate_image", KindUnknown, "generate_image"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			native := Native{Kind: tc.kind, Name: tc.name, Description: "probe-detail"}
+			if call, ok := MapNative(native, []Definition{{Name: tc.name}}); ok {
+				t.Fatalf("expected text fallback, got %+v", call)
+			}
+			if got := NativeToText(native); !strings.Contains(got, tc.want) {
+				t.Fatalf("text fallback lost details: %q", got)
+			}
+		})
+	}
 }
 
 func TestMapNativeReadFile(t *testing.T) {
@@ -294,6 +441,16 @@ func TestWithoutNativeEquivalentKeepsOnlyCustomTools(t *testing.T) {
 }
 
 // 全是内置工具时不注入任何提示词，普通 agent 客户端完全走原生桥接。
+func TestListToolRemainsAvailableThroughTextProtocol(t *testing.T) {
+	def := Definition{Name: "LS", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)}
+	if got := WithoutNativeEquivalent([]Definition{def}); len(got) != 1 || got[0].Name != def.Name {
+		t.Fatalf("list tool missing from fallback prompt: %+v", got)
+	}
+	if _, ok := MapNative(Native{Kind: KindListFiles, Path: "/workspace"}, []Definition{def}); !ok {
+		t.Fatal("native list should still be mapped when Cursor emits it")
+	}
+}
+
 func TestWithoutNativeEquivalentCanBeEmpty(t *testing.T) {
 	kept := WithoutNativeEquivalent([]Definition{{Name: "read"}, {Name: "write"}, {Name: "grep"}})
 	if len(kept) != 0 {

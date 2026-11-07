@@ -80,28 +80,30 @@ func (b anthropicBody) toolDefs() []tools.Definition {
 }
 
 // toolChoice 解析 Anthropic 的 tool_choice：{"type":"auto"|"any"|"none"|"tool","name":"x"}。
-func (b anthropicBody) toolChoice() tools.Choice {
+func (b anthropicBody) toolChoice() (tools.Choice, bool) {
+	choice := tools.Choice{Mode: "auto"}
 	if len(b.ToolChoice) == 0 {
-		return tools.Choice{Mode: "auto"}
+		return choice, false
 	}
 	var obj struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type            string `json:"type"`
+		Name            string `json:"name"`
+		DisableParallel bool   `json:"disable_parallel_tool_use"`
 	}
 	if json.Unmarshal(b.ToolChoice, &obj) != nil {
-		return tools.Choice{Mode: "auto"}
+		return choice, false
 	}
 	switch obj.Type {
 	case "none":
-		return tools.Choice{Mode: "none"}
+		choice.Mode = "none"
 	case "any":
-		return tools.Choice{Mode: "required"}
+		choice.Mode = "required"
 	case "tool":
 		if obj.Name != "" {
-			return tools.Choice{Mode: "function", Name: obj.Name}
+			choice = tools.Choice{Mode: "function", Name: obj.Name}
 		}
 	}
-	return tools.Choice{Mode: "auto"}
+	return choice, obj.DisableParallel
 }
 
 // blocksToText 把内容块里的纯文本拍平。
@@ -132,8 +134,8 @@ func blocksToText(raw json.RawMessage) string {
 
 // splitAnthropicMessage 把一条 Anthropic 消息按内容块拆成内部消息序列。
 //
-// Anthropic 把「助手发起的调用」和「工具返回的结果」放在同一条消息的不同块里，
-// 而上游的 conversation_history 要求它们各占一个轮次，所以这里要拆开。
+// Anthropic 的用户消息可以先返回工具结果，再附上正文或图片。
+// 把结果拆成独立的工具轮次，保留后续用户指令的位置。
 func splitAnthropicMessage(m anthropicMessage) []types.Message {
 	var blocks []anthropicBlock
 	if len(m.Content) > 0 && json.Unmarshal(m.Content, &blocks) != nil {
@@ -154,18 +156,6 @@ func splitAnthropicMessage(m anthropicMessage) []types.Message {
 		calls = append(calls, types.ToolCall{ID: b.ID, Name: b.Name, Args: args})
 	}
 
-	text := blocksToText(m.Content)
-	images := blocksToImages(m.Content)
-	if text != "" || len(calls) > 0 || (len(images) > 0 && m.Role != "user") {
-		msg := types.Message{Role: m.Role, Content: text, ToolCalls: calls}
-		if m.Role == "user" {
-			msg.Images = images
-		}
-		out = append(out, msg)
-	} else if len(images) > 0 {
-		out = append(out, types.Message{Role: m.Role, Content: text, Images: images})
-	}
-
 	// 工具结果各自成一轮
 	for _, b := range blocks {
 		if b.Type != "tool_result" {
@@ -177,6 +167,15 @@ func splitAnthropicMessage(m anthropicMessage) []types.Message {
 			// Anthropic 的结果块只带调用 id，工具名由上游按 id 对应
 			ToolCallID: b.ToolUseID, IsError: b.IsError,
 		})
+	}
+	text := blocksToText(m.Content)
+	images := decodeBlockImages(blocks, false)
+	if text != "" || len(calls) > 0 || len(images) > 0 {
+		msg := types.Message{Role: m.Role, Content: text, ToolCalls: calls}
+		if m.Role == "user" {
+			msg.Images = images
+		}
+		out = append(out, msg)
 	}
 	return out
 }
@@ -191,11 +190,17 @@ func blocksToImages(raw json.RawMessage) []types.Image {
 	if json.Unmarshal(raw, &blocks) != nil {
 		return nil
 	}
+	return decodeBlockImages(blocks, true)
+}
+
+func decodeBlockImages(blocks []anthropicBlock, includeToolResults bool) []types.Image {
 	var out []types.Image
 	for _, b := range blocks {
 		switch b.Type {
 		case "tool_result":
-			out = append(out, blocksToImages(b.Content)...)
+			if includeToolResults {
+				out = append(out, blocksToImages(b.Content)...)
+			}
 		case "image":
 			if b.Source == nil {
 				continue
@@ -258,8 +263,10 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = "auto"
 	}
-	tl := newTimeline("messages " + model)
-	tl.mark("读请求体")
+	tl := newTimeline("messages "+model, startedAt)
+	var timingDetail string
+	defer func() { tl.done(timingDetail) }()
+	tl.mark("读请求体和解 JSON")
 
 	messages := anthropicToInternal(body)
 	hasNonSystem := false
@@ -275,7 +282,16 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	toolDefs := body.toolDefs()
-	messages = injectToolPrompt(messages, toolDefs, body.toolChoice())
+	toolChoice, singleTool := body.toolChoice()
+	toolDefs = allowedToolDefinitions(toolDefs, toolChoice)
+	if len(toolDefs) == 0 && requiresTool(toolChoice) {
+		WriteJSON(w, 400, map[string]any{"type": "error", "error": map[string]any{
+			"type": "invalid_request_error", "message": "tool_choice requires a declared tool",
+		}})
+		return
+	}
+	fileTools, promptTools := prepareFileTools(toolDefs)
+	messages = injectToolPrompt(messages, promptTools, toolChoice)
 
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	keyPrefix := anthropicKeyPrefix(r)
@@ -287,7 +303,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	open := func() (*OpenedStream, *cursor.UpstreamError) {
-		return OpenWithFailover(ctx, messages, model, ModeFor(len(toolDefs)))
+		return OpenWithFailover(ctx, messages, model, ModeFor(len(toolDefs)), len(toolDefs) > 0, fileTools)
 	}
 	var opened *OpenedStream
 	var uerr *cursor.UpstreamError
@@ -313,7 +329,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			}))
 			wire.write(sse("ping", map[string]any{"type": "ping"}))
 		}
-		opened, uerr = wire.awaitOpen(startStream, open)
+		opened, uerr = wire.awaitOpen(startedAt, startStream, open)
 	} else {
 		opened, uerr = open()
 	}
@@ -331,18 +347,21 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				WriteJSON(w, status, payload)
 			}
 		}
+		errMsg := uerr.Msg
 		if ctx.Err() != nil {
-			status, uerr = clientClosedStatus, clientDisconnected()
+			status, errMsg = clientClosedStatus, wire.disconnectMessage()
 		}
+		timingDetail = fmt.Sprintf(" :: 输入 %d tok / 状态 %d", inputTokens, status)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, KeyPrefix: keyPrefix, Stream: body.Stream,
 			Status: "error", HTTPStatus: status, Ms: time.Since(startedAt).Milliseconds(), InputTokens: inputTokens,
-			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
+			Error: trunc(errMsg, 200), Request: reqlog.SanitizeRequest(raw)})
 		return
 	}
 
 	account := opened.Account
 	defer opened.Stream.Close()
 	events := Chain(ctx, opened.Buffered, opened.Stream)
+	toolOutput := newToolOutput(toolDefs, singleTool, fileTools)
 
 	if body.Stream {
 		startStream()
@@ -362,10 +381,6 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		// 上游给了 3000 多字推理，全被扔了，等于白付了这部分 token。
 		blk := &blockWriter{send: send}
 
-		var scanner *tools.Scanner
-		if len(toolDefs) > 0 {
-			scanner = &tools.Scanner{}
-		}
 		emitText := func(text string) {
 			if text == "" {
 				return
@@ -376,7 +391,6 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var calls []tools.Call
 		truncated := false
 		gotFirst := false
 		// 纯对话时把写文件的内容边收边吐，避免长内容静默几十秒再整段出现
@@ -399,11 +413,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 				}
 				if ev.Text != "" {
 					emitText(live.Interrupt())
-					if scanner != nil {
-						emitText(scanner.Push(ev.Text))
-					} else {
-						emitText(ev.Text)
-					}
+					emitText(toolOutput.text(ev.Text))
 				}
 			case cursor.EventToolInputDelta:
 				emitText(live.Push(toNativePtr(ev.Tool), ev.Text))
@@ -413,11 +423,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				// 上游内置工具调用：翻译成客户端声明的工具
-				if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
-					calls = append(calls, c)
-				} else {
-					emitText(tools.NativeToText(toNative(ev.Tool)))
-				}
+				emitText(toolOutput.native(ev.Tool))
 			case cursor.EventEnd:
 				truncated = ev.Truncated
 			case cursor.EventError:
@@ -435,27 +441,37 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		if truncated {
 			stopReason = "max_tokens"
 		}
-		if scanner != nil && !errored && !wire.disconnected() {
-			emitText(scanner.Flush())
-			calls = append(calls, scanner.Calls()...)
+		if !errored && !wire.disconnected() {
+			emitText(toolOutput.flush())
+			if message, _ := toolOutput.completionError(toolChoice, truncated); message != "" {
+				errored, errMsg = true, message
+				terminalDelivered = send("error", anthropicAPIError(errMsg))
+			}
 		}
 		var deliveredCalls []tools.Call
 		if !errored && !wire.disconnected() {
 			textIndex := blk.closeAll()
 			// 工具调用各占一个 tool_use 内容块，紧跟在文本块之后。
-			for i, c := range calls {
+			for i, c := range toolOutput.calls {
 				idx := textIndex + 1 + i
-				send("content_block_start", map[string]any{
+				if !send("content_block_start", map[string]any{
 					"type": "content_block_start", "index": idx,
 					"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": map[string]any{}},
-				})
-				if !send("content_block_delta", map[string]any{
-					"type": "content_block_delta", "index": idx,
-					"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Arguments},
 				}) {
 					break
 				}
-				wire.markOutput()
+				if !writeToolArgs(c.Arguments, func(_ bool, part string) bool {
+					if !send("content_block_delta", map[string]any{
+						"type": "content_block_delta", "index": idx,
+						"delta": map[string]any{"type": "input_json_delta", "partial_json": part},
+					}) {
+						return false
+					}
+					wire.markOutput()
+					return true
+				}) {
+					break
+				}
 				deliveredCalls = append(deliveredCalls, c)
 				stopReason = "tool_use"
 				send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
@@ -470,8 +486,8 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			})
 			terminalDelivered = send("message_stop", map[string]any{"type": "message_stop"})
 		}
-		tl.done(fmt.Sprintf(" :: 输入 %d tok / 输出 %d tok / %d 字",
-			inputTokens, outputTokens, utf8.RuneCountInString(content.String())))
+		timingDetail = fmt.Sprintf(" :: 输入 %d tok / 输出 %d tok / %d 字",
+			inputTokens, outputTokens, utf8.RuneCountInString(content.String()))
 
 		outcome := cursor.OutcomeSuccess
 		if errored {
@@ -479,7 +495,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		}
 		httpStatus := 0
 		if !terminalDelivered && wire.disconnected() {
-			outcome, errored, errMsg, httpStatus = cursor.OutcomeCanceled, true, clientDisconnected().Msg, clientClosedStatus
+			outcome, errored, errMsg, httpStatus = cursor.OutcomeCanceled, true, wire.disconnectMessage(), clientClosedStatus
 		}
 		cursor.ReleaseAccount(account.ID, outcome, errMsg)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
@@ -493,17 +509,12 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	content := ""
 	lastError := ""
 	truncated := false
-	var toolCalls []tools.Call
 	for ev := range events {
 		switch ev.Kind {
 		case cursor.EventDelta:
-			content += ev.Text
+			content += toolOutput.text(ev.Text)
 		case cursor.EventToolCall:
-			if c, ok := mapNativeCall(ev.Tool, toolDefs); ok {
-				toolCalls = append(toolCalls, c)
-			} else {
-				content += tools.NativeToText(toNative(ev.Tool))
-			}
+			content += toolOutput.native(ev.Tool)
 		case cursor.EventEnd:
 			truncated = ev.Truncated
 		case cursor.EventError:
@@ -518,13 +529,12 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(toolDefs) > 0 {
-		var scanner tools.Scanner
-		content = scanner.Push(content) + scanner.Flush()
-		toolCalls = append(toolCalls, scanner.Calls()...)
+	content += toolOutput.flush()
+	toolCalls := toolOutput.calls
+	if lastError == "" {
+		lastError, _ = toolOutput.completionError(toolChoice, truncated)
 	}
-
-	if content == "" && len(toolCalls) == 0 && lastError != "" {
+	if lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: false, Status: "error", HTTPStatus: 502, Ms: time.Since(startedAt).Milliseconds(), InputTokens: inputTokens,
