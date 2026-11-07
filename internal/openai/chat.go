@@ -14,6 +14,7 @@ import (
 
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/reqlog"
+	"cursor-proxy/internal/store"
 	"cursor-proxy/internal/tokenize"
 	"cursor-proxy/internal/tools"
 	"cursor-proxy/internal/types"
@@ -230,6 +231,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 	keyPrefix := keyPrefixFromAuth(r)
 	promptTokens := tokenize.CountMessages(body.Model, messages)
+	input := splitInputUsage(promptTokens, store.GetSimulatedCache())
 	tl.mark("算 token")
 
 	opened, uerr := OpenWithFailover(messages, body.Model, ModeFor(len(toolDefs)))
@@ -374,7 +376,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"created": time.Now().Unix(),
 				"model":   body.Model,
 				"choices": []any{},
-				"usage":   usagePayload(promptTokens, completionTokens),
+				"usage":   input.openAI(completionTokens),
 			})
 			writeSSE("data: " + string(payload) + "\n\n")
 		}
@@ -468,7 +470,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"created": time.Now().Unix(),
 		"model":   body.Model,
 		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": finishReason}},
-		"usage":   usagePayload(promptTokens, completionTokens),
+		"usage":   input.openAI(completionTokens),
 	})
 }
 

@@ -9,6 +9,11 @@ export interface ServerInfo {
   adminToken: string
 }
 
+export interface SimulatedCacheSettings {
+  readPercent: number
+  writePercent: number
+}
+
 export interface Account {
   id: string
   label: string
@@ -200,6 +205,15 @@ const del = <T>(path: string) => request<T>(path, { method: 'DELETE' })
 
 export const api = {
   serverInfo: () => request<ServerInfo>('/manage/server/info'),
+
+  simulatedCache: {
+    get: () => request<SimulatedCacheSettings>('/manage/settings/simulated-cache'),
+    save: (settings: SimulatedCacheSettings) =>
+      request<SimulatedCacheSettings>('/manage/settings/simulated-cache', {
+        method: 'PUT',
+        body: JSON.stringify(settings),
+      }),
+  },
 
   accounts: {
     list: () => request<Account[]>('/manage/accounts'),

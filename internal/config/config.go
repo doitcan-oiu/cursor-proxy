@@ -83,7 +83,7 @@ type Config struct {
 	// "bpe"（默认）用内嵌词表精确分词；"estimate" 关闭分词器改用启发式，省约 7MB 内存。
 	TokenizerMode string
 
-	// SimulatedCachePercent 是 usage 中模拟为缓存读取的输入 token 百分比。
+	// SimulatedCachePercent 为首次保存管理界面设置前的模拟缓存读取比例。
 	SimulatedCachePercent int
 
 	Antiban Antiban

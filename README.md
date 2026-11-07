@@ -19,7 +19,7 @@ docker compose logs -f cursor-proxy
 如果原来直接运行二进制，先停止原进程，再让 Compose 挂载同一个数据目录。Windows 上已下载的 Mihomo 内核需要在容器里重新安装 Linux 版。
 
 需要调整配置时，将 `.env.example` 复制为 `.env` 再修改。Compose 用 `HOST` 和 `PORT` 设置宿主机的监听地址和端口，用 `DATA_DIR` 指定宿主机数据目录。
-例如用 `HOST=127.0.0.1` 限制为本机访问，用 `SIMULATED_CACHE_PERCENT=80` 模拟 80% 的缓存读取。修改 `.env` 后执行 `docker compose up -d` 使配置生效。
+例如用 `HOST=127.0.0.1` 限制为本机访问。修改 `.env` 后执行 `docker compose up -d` 使配置生效。模拟缓存可在管理界面的「概览」中设置。
 使用宿主机上的 HTTP 代理时，请将 `CURSOR_HTTP_PROXY` 指向容器能访问的地址。在 Docker Desktop 上可以使用 `host.docker.internal`。
 在 ARM64 容器中使用内置 VPN 时，通过 `MIHOMO_URL` 指定对应架构的 Linux `.gz` 内核。
 
@@ -58,7 +58,7 @@ Vue 3 + Tailwind CSS v4 + shadcn-vue，视觉遵循 [`DESIGN.md`](./DESIGN.md) �
 
 | 页面 | 能做什么 |
 | --- | --- |
-| 概览 | 可用账号、近一分钟请求、成功率、模型数；接入信息一键复制；账号健康与近期请求 |
+| 概览 | 可用账号、近一分钟请求、成功率、模型数；模拟缓存设置；接入信息一键复制；账号健康与近期请求 |
 | 账号池 | 批量导入 / 单条添加（web token 自动换取）、验号（套餐与用量）、独立出口代理、删除 |
 | 访问密钥 | 签发 / 吊销 sk- 密钥，明文仅创建时展示一次 |
 | 模型 | 拉取上游可用模型，搜索、复制模型名 |
@@ -399,24 +399,13 @@ Cursor 上游不返回 token 用量，所以这里由本地计算，见 `interna
 
 OpenAI 流式需要 usage 时按规范传 `stream_options: {"include_usage": true}`。
 
-### 模拟缓存读取
+### 模拟输入缓存
 
-启动时设置 `SIMULATED_CACHE_PERCENT`，可在 OpenAI 和 Anthropic 的 `usage` 中模拟缓存读取。修改后重启服务生效。
-取值为 `0` 到 `100` 的整数，默认 `0`。超出范围或格式无效时按 `0` 处理。
-例如设置为 `80`，每个响应将输入 token 数的 80% 向下取整后计为模拟缓存读取。
-模拟比例只用于响应中的用量字段。每次请求照常转发给 Cursor，实际费用仍以 Cursor 的用量为准。
+登录管理界面，打开「概览」中的「模拟缓存」，分别设置缓存读取和写入比例。两个值都是 `0` 到 `100` 的整数，合计最多 `100`，都设为 `0` 即关闭。
+例如输入为 1,000 token，读比例为 70%、写比例为 20% 时，响应会报告读取 700、写入 200，其余 100 为普通输入。读写 token 分别向下取整。
 
-```bash
-SIMULATED_CACHE_PERCENT=80 ./cursor-proxy
-```
-
-PowerShell 下构建并启动：
-
-```powershell
-go build -o cursor-proxy.exe ./cmd/server
-$env:SIMULATED_CACHE_PERCENT = '80'
-.\cursor-proxy.exe
-```
+保存后对新请求生效，设置保存在数据目录中。首次保存前，旧环境变量 `SIMULATED_CACHE_PERCENT` 提供读取比例的初始值，写入比例为 `0`。
+OpenAI 和 Anthropic 的 JSON 与流式 `usage` 都支持这两项用量。模拟只改变响应中的用量统计，请求照常转发给 Cursor，实际用量以 Cursor 为准。
 
 ## 其它路由
 

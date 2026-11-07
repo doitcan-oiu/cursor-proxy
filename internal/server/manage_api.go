@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 	"cursor-proxy/internal/config"
 	"cursor-proxy/internal/manage"
 	"cursor-proxy/internal/openai"
+	"cursor-proxy/internal/store"
 	"cursor-proxy/internal/toollog"
 )
 
@@ -27,6 +30,10 @@ func manageHandler() http.Handler {
 	mux.HandleFunc("GET /manage/server/info", func(w http.ResponseWriter, r *http.Request) {
 		openai.WriteJSON(w, 200, manage.GetServerInfo())
 	})
+	mux.HandleFunc("GET /manage/settings/simulated-cache", func(w http.ResponseWriter, r *http.Request) {
+		openai.WriteJSON(w, 200, store.GetSimulatedCache())
+	})
+	mux.HandleFunc("PUT /manage/settings/simulated-cache", setSimulatedCache)
 
 	mux.HandleFunc("GET /manage/accounts", func(w http.ResponseWriter, r *http.Request) {
 		openai.WriteJSON(w, 200, manage.ListAccounts())
@@ -174,6 +181,29 @@ func manageHandler() http.Handler {
 	mux.HandleFunc("POST /manage/chat/test-stream", testChatStream)
 
 	return manageAuth(mux)
+}
+
+func setSimulatedCache(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ReadPercent  *int `json:"readPercent"`
+		WritePercent *int `json:"writePercent"`
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024))
+	if err != nil || json.Unmarshal(raw, &body) != nil || body.ReadPercent == nil || body.WritePercent == nil {
+		openai.WriteJSON(w, 400, map[string]any{"error": "请填写整数缓存读取比例和写入比例"})
+		return
+	}
+	settings := store.SimulatedCacheSettings{ReadPercent: *body.ReadPercent, WritePercent: *body.WritePercent}
+	if err := store.SetSimulatedCache(settings); err != nil {
+		if err == store.ErrInvalidSimulatedCache {
+			openai.WriteJSON(w, 400, map[string]any{"error": err.Error()})
+			return
+		}
+		log.Printf("[manage] 保存模拟缓存设置失败: %v", err)
+		openai.WriteJSON(w, 500, map[string]any{"error": "模拟缓存设置保存失败"})
+		return
+	}
+	openai.WriteJSON(w, 200, settings)
 }
 
 // testChatStream 以 SSE 把测试对话的增量实时推给 WebUI。

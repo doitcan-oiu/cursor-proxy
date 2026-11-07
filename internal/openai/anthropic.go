@@ -14,6 +14,7 @@ import (
 
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/reqlog"
+	"cursor-proxy/internal/store"
 	"cursor-proxy/internal/tokenize"
 	"cursor-proxy/internal/tools"
 	"cursor-proxy/internal/types"
@@ -275,6 +276,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	keyPrefix := anthropicKeyPrefix(r)
 	tl.mark("解析消息")
 	inputTokens := tokenize.CountMessages(model, messages)
+	input := splitInputUsage(inputTokens, store.GetSimulatedCache())
 	tl.mark("算 token")
 
 	opened, uerr := OpenWithFailover(messages, model, ModeFor(len(toolDefs)))
@@ -319,7 +321,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			"message": map[string]any{
 				"id": id, "type": "message", "role": "assistant", "model": model,
 				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-				"usage": anthropicUsage(inputTokens, 0),
+				"usage": input.anthropic(0),
 			},
 		})
 		send("ping", map[string]any{"type": "ping"})
@@ -417,7 +419,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		send("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-			"usage": anthropicUsage(inputTokens, outputTokens),
+			"usage": input.anthropic(outputTokens),
 		})
 		send("message_stop", map[string]any{"type": "message_stop"})
 		tl.done(fmt.Sprintf(" :: 输入 %d tok / 输出 %d tok / %d 字",
@@ -503,7 +505,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		"content":       blocks,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage":         anthropicUsage(inputTokens, outputTokens),
+		"usage":         input.anthropic(outputTokens),
 	})
 }
 

@@ -1,4 +1,4 @@
-// Package store 负责账号凭证与代理 Key 的持久化。
+// Package store 负责账号凭证、代理 Key 和管理配置的持久化。
 //
 // 相比原 Node 版「每次调用都读磁盘」的做法，这里在内存中缓存整份数据，
 // 用读写锁保护并发访问，仅在发生写操作时原子落盘（写临时文件再 rename）。
@@ -7,6 +7,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -53,14 +54,15 @@ type ProxyKeyEntry struct {
 
 // Shape 是落盘 JSON 的顶层结构。
 type Shape struct {
-	CursorTokens []CursorTokenEntry `json:"cursorTokens"`
-	ProxyKeys    []ProxyKeyEntry    `json:"proxyKeys"`
+	CursorTokens   []CursorTokenEntry      `json:"cursorTokens"`
+	ProxyKeys      []ProxyKeyEntry         `json:"proxyKeys"`
+	SimulatedCache *SimulatedCacheSettings `json:"simulatedCache,omitempty"`
 }
 
 var (
-	mu     sync.RWMutex
-	data   *Shape
-	loaded bool
+	mu       sync.RWMutex
+	data     *Shape
+	loadOnce sync.Once
 )
 
 func filePath() string {
@@ -68,21 +70,19 @@ func filePath() string {
 }
 
 func loadLocked() {
-	if loaded {
-		return
-	}
-	data = &Shape{}
-	if raw, err := os.ReadFile(filePath()); err == nil {
-		_ = json.Unmarshal(raw, data)
-	}
-	loaded = true
+	loadOnce.Do(func() {
+		data = &Shape{}
+		if raw, err := os.ReadFile(filePath()); err == nil {
+			_ = json.Unmarshal(raw, data)
+		}
+	})
 }
 
-func persistLocked() error {
+func persistLocked(snapshot *Shape) error {
 	if err := config.EnsureDataDir(); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(data, "", "  ")
+	raw, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -104,6 +104,10 @@ func Read() Shape {
 	}
 	copy(out.CursorTokens, data.CursorTokens)
 	copy(out.ProxyKeys, data.ProxyKeys)
+	if data.SimulatedCache != nil {
+		settings := *data.SimulatedCache
+		out.SimulatedCache = &settings
+	}
 	return out
 }
 
@@ -113,6 +117,47 @@ func Mutate[T any](fn func(s *Shape) T) T {
 	defer mu.Unlock()
 	loadLocked()
 	result := fn(data)
-	_ = persistLocked()
+	_ = persistLocked(data)
 	return result
+}
+
+// SimulatedCacheSettings 记录分别计为模拟读取和写入的输入 token 百分比。
+type SimulatedCacheSettings struct {
+	ReadPercent  int `json:"readPercent"`
+	WritePercent int `json:"writePercent"`
+}
+
+var ErrInvalidSimulatedCache = errors.New("缓存读写比例必须是 0 到 100 的整数，且合计不能超过 100%")
+
+func (s SimulatedCacheSettings) valid() bool {
+	return s.ReadPercent >= 0 && s.ReadPercent <= 100 &&
+		s.WritePercent >= 0 && s.WritePercent <= 100 && s.ReadPercent+s.WritePercent <= 100
+}
+
+// GetSimulatedCache 返回生效的缓存配置。首次保存前沿用旧的环境变量。
+func GetSimulatedCache() SimulatedCacheSettings {
+	mu.RLock()
+	defer mu.RUnlock()
+	loadLocked()
+	if settings := data.SimulatedCache; settings != nil && settings.valid() {
+		return *settings
+	}
+	return SimulatedCacheSettings{ReadPercent: config.Get().SimulatedCachePercent}
+}
+
+// SetSimulatedCache 在写盘成功后发布配置。
+func SetSimulatedCache(settings SimulatedCacheSettings) error {
+	if !settings.valid() {
+		return ErrInvalidSimulatedCache
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	loadLocked()
+	updated := *data
+	updated.SimulatedCache = &settings
+	if err := persistLocked(&updated); err != nil {
+		return err
+	}
+	data = &updated
+	return nil
 }

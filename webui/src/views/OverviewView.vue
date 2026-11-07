@@ -5,6 +5,7 @@ import { ArrowUpRightIcon, RefreshCwIcon } from '@lucide/vue'
 import PageHeader from '@/components/app/PageHeader.vue'
 import SurfaceCard from '@/components/app/SurfaceCard.vue'
 import VibrantCard from '@/components/app/VibrantCard.vue'
+import SimulatedCacheCard from '@/components/app/SimulatedCacheCard.vue'
 import CopyField from '@/components/app/CopyField.vue'
 import StatusDot from '@/components/app/StatusDot.vue'
 import { Badge } from '@/components/ui/badge'
@@ -91,6 +92,8 @@ onUnmounted(() => window.clearInterval(timer))
         :caption="vpn?.running ? `出口：${vpn.current || '机场节点'}` : '出口：直连'"
       />
     </div>
+
+    <SimulatedCacheCard class="mt-6" />
 
     <div class="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
       <!-- 接入信息 -->

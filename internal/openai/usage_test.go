@@ -4,42 +4,36 @@ import (
 	"reflect"
 	"testing"
 
-	"cursor-proxy/internal/config"
+	"cursor-proxy/internal/store"
 )
 
 func TestSimulatedCacheUsage(t *testing.T) {
 	const input, output = 13, 7
 	for _, tc := range []struct {
-		name, percent string
+		name          string
+		settings      store.SimulatedCacheSettings
 		enabled       bool
-		cached        int
+		read, written int
 	}{
-		{name: "default"},
-		{name: "disabled", percent: "0"},
-		{name: "invalid", percent: "80%"},
-		{name: "out of range", percent: "101"},
-		{name: "negative", percent: "-1"},
-		{name: "rounded down to zero", percent: "1", enabled: true},
-		{name: "partial", percent: "80", enabled: true, cached: 10},
-		{name: "full", percent: "100", enabled: true, cached: input},
+		{name: "disabled"},
+		{name: "rounded down to zero", settings: store.SimulatedCacheSettings{ReadPercent: 1, WritePercent: 1}, enabled: true},
+		{name: "split and round down", settings: store.SimulatedCacheSettings{ReadPercent: 80, WritePercent: 20}, enabled: true, read: 10, written: 2},
+		{name: "full read", settings: store.SimulatedCacheSettings{ReadPercent: 100}, enabled: true, read: input},
+		{name: "full write", settings: store.SimulatedCacheSettings{WritePercent: 100}, enabled: true, written: input},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("ADMIN_TOKEN", "test-token")
-			t.Setenv("SIMULATED_CACHE_PERCENT", tc.percent)
-			config.Reset()
-			t.Cleanup(config.Reset)
-
 			wantOpenAI := map[string]any{"prompt_tokens": input, "completion_tokens": output, "total_tokens": input + output}
-			wantAnthropic := map[string]any{"input_tokens": input - tc.cached, "output_tokens": output}
+			wantAnthropic := map[string]any{"input_tokens": input - tc.read - tc.written, "output_tokens": output}
 			if tc.enabled {
-				wantOpenAI["prompt_tokens_details"] = map[string]int{"cached_tokens": tc.cached}
-				wantAnthropic["cache_read_input_tokens"] = tc.cached
-				wantAnthropic["cache_creation_input_tokens"] = 0
+				wantOpenAI["prompt_tokens_details"] = map[string]int{"cached_tokens": tc.read, "cache_write_tokens": tc.written}
+				wantAnthropic["cache_read_input_tokens"] = tc.read
+				wantAnthropic["cache_creation_input_tokens"] = tc.written
 			}
-			if got := usagePayload(input, output); !reflect.DeepEqual(got, wantOpenAI) {
+			usage := splitInputUsage(input, tc.settings)
+			if got := usage.openAI(output); !reflect.DeepEqual(got, wantOpenAI) {
 				t.Errorf("OpenAI usage = %v, want %v", got, wantOpenAI)
 			}
-			if got := anthropicUsage(input, output); !reflect.DeepEqual(got, wantAnthropic) {
+			if got := usage.anthropic(output); !reflect.DeepEqual(got, wantAnthropic) {
 				t.Errorf("Anthropic usage = %v, want %v", got, wantAnthropic)
 			}
 		})

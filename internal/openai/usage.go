@@ -1,35 +1,47 @@
 package openai
 
-import "cursor-proxy/internal/config"
+import "cursor-proxy/internal/store"
 
-// simulatedCacheTokens 只划分 usage 中估算的输入 token。
-func simulatedCacheTokens(inputTokens int) (cached int, enabled bool) {
-	percent := config.Get().SimulatedCachePercent
-	return int(int64(inputTokens) * int64(percent) / 100), percent > 0
+type inputUsage struct {
+	total      int
+	cacheRead  int
+	cacheWrite int
+	simulated  bool
 }
 
-func usagePayload(promptTokens, completionTokens int) map[string]any {
-	usage := map[string]any{
-		"prompt_tokens":     promptTokens,
-		"completion_tokens": completionTokens,
-		"total_tokens":      promptTokens + completionTokens,
+// splitInputUsage 按请求开始时的设置划分输入 token，整条 SSE 流复用同一份用量。
+func splitInputUsage(total int, settings store.SimulatedCacheSettings) inputUsage {
+	return inputUsage{
+		total:      total,
+		cacheRead:  int(int64(total) * int64(settings.ReadPercent) / 100),
+		cacheWrite: int(int64(total) * int64(settings.WritePercent) / 100),
+		simulated:  settings.ReadPercent > 0 || settings.WritePercent > 0,
 	}
-	if cached, enabled := simulatedCacheTokens(promptTokens); enabled {
-		usage["prompt_tokens_details"] = map[string]int{"cached_tokens": cached}
+}
+
+func (input inputUsage) openAI(completionTokens int) map[string]any {
+	usage := map[string]any{
+		"prompt_tokens":     input.total,
+		"completion_tokens": completionTokens,
+		"total_tokens":      input.total + completionTokens,
+	}
+	if input.simulated {
+		usage["prompt_tokens_details"] = map[string]int{
+			"cached_tokens":      input.cacheRead,
+			"cache_write_tokens": input.cacheWrite,
+		}
 	}
 	return usage
 }
 
-func anthropicUsage(inputTokens, outputTokens int) map[string]any {
+func (input inputUsage) anthropic(outputTokens int) map[string]any {
 	usage := map[string]any{
-		"input_tokens":  inputTokens,
+		"input_tokens":  input.total - input.cacheRead - input.cacheWrite,
 		"output_tokens": outputTokens,
 	}
-	if cached, enabled := simulatedCacheTokens(inputTokens); enabled {
-		// Anthropic 的 input_tokens 只包含未命中的部分。
-		usage["input_tokens"] = inputTokens - cached
-		usage["cache_read_input_tokens"] = cached
-		usage["cache_creation_input_tokens"] = 0
+	if input.simulated {
+		usage["cache_read_input_tokens"] = input.cacheRead
+		usage["cache_creation_input_tokens"] = input.cacheWrite
 	}
 	return usage
 }
