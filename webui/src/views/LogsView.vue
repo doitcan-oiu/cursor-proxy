@@ -17,6 +17,11 @@ const onlyErrors = ref(false)
 /** 展开了请求体的日志 id。失败时才会有请求体。 */
 const expanded = ref(new Set<number>())
 let timer: number | undefined
+const tokenNumber = new Intl.NumberFormat('zh-CN')
+
+function formatTokens(tokens?: number) {
+  return tokens == null ? '—' : `${tokenNumber.format(tokens)} tok`
+}
 
 function toggle(id: number) {
   const next = new Set(expanded.value)
@@ -31,8 +36,13 @@ function report(e: LogEntry) {
       time: new Date(e.time).toISOString(),
       model: e.model,
       stream: e.stream,
+      status: e.status,
       httpStatus: e.httpStatus,
+      inputTokens: e.inputTokens,
+      outputTokens: e.tokens,
+      firstTokenMs: e.firstTokenMs,
       ms: e.ms,
+      tps: e.tps,
       error: e.error,
       request: tryParse(e.request),
     },
@@ -183,46 +193,48 @@ onUnmounted(() => window.clearInterval(timer))
       />
 
       <div v-else class="overflow-x-auto">
-        <table class="w-full min-w-[860px] text-sm">
+        <table class="w-full min-w-[1040px] text-sm">
           <thead>
             <tr class="border-b border-hairline-soft bg-surface text-left text-[12px] font-semibold text-steel">
-              <th class="px-6 py-3 font-semibold">时间</th>
-              <th class="px-6 py-3 font-semibold">类型</th>
-              <th class="px-6 py-3 font-semibold">模型</th>
-              <th class="px-6 py-3 font-semibold">账号</th>
-              <th class="px-6 py-3 font-semibold">密钥</th>
-              <th class="px-6 py-3 text-right font-semibold">耗时</th>
-              <th class="px-6 py-3 text-right font-semibold">输出</th>
-              <th class="px-6 py-3 text-right font-semibold">状态</th>
+              <th scope="col" class="px-4 py-3 font-semibold">时间</th>
+              <th scope="col" class="px-4 py-3 font-semibold">类型</th>
+              <th scope="col" class="px-4 py-3 font-semibold">模型</th>
+              <th scope="col" class="px-4 py-3 font-semibold">账号</th>
+              <th scope="col" class="px-4 py-3 text-right font-semibold">输入</th>
+              <th scope="col" class="px-4 py-3 text-right font-semibold">输出</th>
+              <th scope="col" class="px-4 py-3 text-right font-semibold whitespace-nowrap">首字时间</th>
+              <th scope="col" class="px-4 py-3 text-right font-semibold whitespace-nowrap">完整时间</th>
+              <th scope="col" class="px-4 py-3 text-right font-semibold" title="端到端平均速度（输出 token 数 ÷ 完整耗时秒数）">TPS</th>
+              <th scope="col" class="px-4 py-3 text-right font-semibold">状态</th>
             </tr>
           </thead>
           <tbody>
             <template v-for="e in visible" :key="e.id">
               <tr class="border-b border-hairline-soft" :class="e.error ? 'border-b-0' : ''">
-                <td class="px-6 py-3 text-steel tabular">{{ formatTime(e.time) }}</td>
-                <td class="px-6 py-3">
+                <td class="px-4 py-3 whitespace-nowrap text-steel tabular">{{ formatTime(e.time) }}</td>
+                <td class="px-4 py-3">
                   <Badge v-if="e.stream" variant="beta">流式</Badge>
-                  <Badge v-else variant="outline">{{ e.kind }}</Badge>
+                  <Badge v-else variant="outline">{{ e.kind === 'chat' ? '非流式' : e.kind }}</Badge>
                 </td>
-                <td class="px-6 py-3 font-mono text-[13px] text-ink">{{ e.model || '—' }}</td>
-                <td class="px-6 py-3 text-steel">{{ e.account || '—' }}</td>
-                <td class="px-6 py-3 font-mono text-[12px] text-stone">{{ e.keyPrefix || '—' }}</td>
-                <td class="px-6 py-3 text-right text-steel tabular">{{ formatDuration(e.ms) }}</td>
-                <td class="px-6 py-3 text-right tabular">
-                  <template v-if="e.chars">
-                    <div class="text-steel">{{ e.chars }} 字</div>
-                    <div v-if="e.tokens" class="text-[12px] text-stone" title="估算值">≈{{ e.tokens }} tok</div>
-                  </template>
-                  <span v-else class="text-steel">—</span>
+                <td class="px-4 py-3 font-mono text-[13px] text-ink">{{ e.model || '—' }}</td>
+                <td class="px-4 py-3 text-steel">
+                  <div class="max-w-[200px] truncate" :title="e.account">{{ e.account || '—' }}</div>
                 </td>
-                <td class="px-6 py-3 text-right">
+                <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ formatTokens(e.inputTokens) }}</td>
+                <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ formatTokens(e.tokens) }}</td>
+                <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">
+                  {{ e.firstTokenMs == null ? '—' : formatDuration(e.firstTokenMs) }}
+                </td>
+                <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ formatDuration(e.ms) }}</td>
+                <td class="px-4 py-3 text-right whitespace-nowrap text-steel tabular">{{ e.tps == null ? '—' : e.tps.toFixed(1) }}</td>
+                <td class="px-4 py-3 text-right">
                   <Badge :variant="e.status === 'ok' ? 'success' : 'danger'">
-                    {{ e.status === 'ok' ? '成功' : e.httpStatus || '失败' }}
+                    {{ e.status === 'ok' ? '成功' : e.httpStatus === 499 ? '下游断开' : e.httpStatus || '失败' }}
                   </Badge>
                 </td>
               </tr>
               <tr v-if="e.error" class="border-b border-hairline-soft">
-                <td colspan="8" class="px-6 pb-3">
+                <td colspan="10" class="px-4 pb-3">
                   <p class="rounded-md bg-danger-bg px-3 py-2 text-[12px] leading-relaxed text-danger">
                     {{ e.error }}
                   </p>

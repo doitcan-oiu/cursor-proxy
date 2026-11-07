@@ -117,6 +117,22 @@ func TestSuccessClearsPenalty(t *testing.T) {
 	}
 }
 
+func TestCanceledRequestReleasesAccountWithoutChangingHealth(t *testing.T) {
+	resetHealth(t)
+	ReleaseAccount("acc-1", OutcomeError, "upstream error")
+	hmu.Lock()
+	getHealth("acc-1").inFlight = 1
+	hmu.Unlock()
+
+	ReleaseAccount("acc-1", OutcomeCanceled, "")
+	hmu.Lock()
+	defer hmu.Unlock()
+	h := getHealth("acc-1")
+	if h.inFlight != 0 || h.consecutiveFailures != 1 || h.lastOutcome != OutcomeError {
+		t.Fatalf("cancel changed account health: %+v", h)
+	}
+}
+
 // 降权只在一段时间内有效，一次偶发抖动不该永久压着某个账号。
 func TestPenaltyDecaysOverTime(t *testing.T) {
 	h := &health{consecutiveFailures: 3, lastFailureAt: 1000}

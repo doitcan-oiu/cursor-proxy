@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -24,13 +25,13 @@ func needsRefresh(entry store.CursorTokenEntry) bool {
 }
 
 // refreshAccessToken 用 refresh token 换取新的 access token。
-func refreshAccessToken(refreshToken string) string {
+func refreshAccessToken(ctx context.Context, refreshToken string) string {
 	body, _ := json.Marshal(map[string]string{
 		"grant_type":    "refresh_token",
 		"client_id":     authClientID,
 		"refresh_token": refreshToken,
 	})
-	req, _ := http.NewRequest(http.MethodPost, config.Get().CursorBackendURL+"/oauth/token", strings.NewReader(string(body)))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, config.Get().CursorBackendURL+"/oauth/token", strings.NewReader(string(body)))
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("accept", "application/json")
 	resp, err := httpx.Client("").Do(req)
@@ -56,10 +57,14 @@ func refreshAccessToken(refreshToken string) string {
 
 // EnsureFreshToken 确保凭证新鲜：临近过期则刷新并持久化，返回可用的 Bearer JWT。
 func EnsureFreshToken(entry store.CursorTokenEntry) string {
+	return ensureFreshToken(context.Background(), entry)
+}
+
+func ensureFreshToken(ctx context.Context, entry store.CursorTokenEntry) string {
 	if !needsRefresh(entry) {
 		return auth.ExtractBearer(entry.Token)
 	}
-	if next := refreshAccessToken(entry.RefreshToken); next != "" {
+	if next := refreshAccessToken(ctx, entry.RefreshToken); next != "" {
 		auth.UpdateTokenValue(entry.ID, next)
 		return auth.ExtractBearer(next)
 	}
@@ -71,7 +76,7 @@ func StartRefreshSweeper(interval time.Duration) {
 	run := func() {
 		for _, entry := range store.Read().CursorTokens {
 			if needsRefresh(entry) {
-				if next := refreshAccessToken(entry.RefreshToken); next != "" && auth.TokenExpiry(next) != 0 {
+				if next := refreshAccessToken(context.Background(), entry.RefreshToken); next != "" && auth.TokenExpiry(next) != 0 {
 					auth.UpdateTokenValue(entry.ID, next)
 				}
 			}

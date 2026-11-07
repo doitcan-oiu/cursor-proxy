@@ -172,13 +172,18 @@ var hardCapFor = func() time.Duration {
 //
 // mode 决定上游按 agent 还是纯问答行事，见 AskMode / AgentMode。
 func StreamAgent(messages []types.Message, modelID, token, proxyURL string, mode proto.Mode) (*AgentStream, error) {
-	bearer := auth.ExtractBearer(token)
-	initial := connectFrame(proto.EncodeAgentRequest(messages, modelID, mode))
-	return openAgentStream(httpx.Client(proxyURL), runURL(), agentHeaders(bearer, "application/connect+proto"), initial, modelID)
+	return StreamAgentContext(context.Background(), messages, modelID, token, proxyURL, mode)
 }
 
-func openAgentStream(client *http.Client, endpoint string, headers http.Header, initial []byte, modelID string) (*AgentStream, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+// StreamAgentContext 将下游取消传给 Cursor 的双向流。
+func StreamAgentContext(ctx context.Context, messages []types.Message, modelID, token, proxyURL string, mode proto.Mode) (*AgentStream, error) {
+	bearer := auth.ExtractBearer(token)
+	initial := connectFrame(proto.EncodeAgentRequest(messages, modelID, mode))
+	return openAgentStream(ctx, httpx.Client(proxyURL), runURL(), agentHeaders(bearer, "application/connect+proto"), initial, modelID)
+}
+
+func openAgentStream(parent context.Context, client *http.Client, endpoint string, headers http.Header, initial []byte, modelID string) (*AgentStream, error) {
+	ctx, cancel := context.WithCancel(parent)
 	reader, writer := io.Pipe()
 	stopClosing := context.AfterFunc(ctx, func() { _ = reader.CloseWithError(ctx.Err()) })
 	// Run 是双向流。发完初始请求后仍要保留写端，供上游 KV 请求回包。

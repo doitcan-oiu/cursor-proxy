@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -187,6 +188,17 @@ func sseChunk(id, model string, delta map[string]any, finish any) string {
 	return "data: " + string(b) + "\n\n"
 }
 
+func chatStreamError(message, typ, code string) string {
+	var body ErrorBody
+	body.Error.Message = message
+	body.Error.Type = typ
+	if code != "" {
+		body.Error.Code = &code
+	}
+	payload, _ := json.Marshal(body)
+	return "data: " + string(payload) + "\n\n"
+}
+
 func keyPrefixFromAuth(r *http.Request) string {
 	bearer := stripBearer(r.Header.Get("authorization"))
 	if len(bearer) > 10 {
@@ -197,6 +209,7 @@ func keyPrefixFromAuth(r *http.Request) string {
 
 // ChatCompletions 处理 POST /v1/chat/completions。
 func ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
 	// 原始请求体留着：出错时记进日志，便于原样复现。
 	// 只读一次，之后都用这份字节。
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
@@ -228,56 +241,72 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	tl.mark("解析消息")
 
 	id := "chatcmpl-" + uuid.NewString()
-	startedAt := time.Now()
 	keyPrefix := keyPrefixFromAuth(r)
 	promptTokens := tokenize.CountMessages(body.Model, messages)
 	input := splitInputUsage(promptTokens, store.GetSimulatedCache())
 	tl.mark("算 token")
 
-	opened, uerr := OpenWithFailover(messages, body.Model, ModeFor(len(toolDefs)))
-	tl.mark("取号+建流")
-	if uerr != nil {
-		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Stream: body.Stream, KeyPrefix: keyPrefix,
-			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(),
-			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
-		if uerr.Status == 0 || uerr.Status == 503 {
-			SendError(w, 503, "无可用 Cursor 账号: "+FriendlyUpstream(uerr.Msg), "server_error", "no_account_available")
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	open := func() (*OpenedStream, *cursor.UpstreamError) {
+		return OpenWithFailover(ctx, messages, body.Model, ModeFor(len(toolDefs)))
+	}
+	var opened *OpenedStream
+	var uerr *cursor.UpstreamError
+	var wire *sseResponse
+	var startStream func()
+	if body.Stream {
+		if _, ok := w.(http.Flusher); !ok {
+			SendError(w, 500, "streaming unsupported", "server_error", "")
 			return
 		}
-		typ := "upstream_error"
-		if uerr.Status == 429 {
+		wire = newSSEResponse(ctx, cancel, w)
+		startStream = func() {
+			if !wire.started {
+				wire.write(sseChunk(id, body.Model, map[string]any{"role": "assistant"}, nil))
+			}
+		}
+		opened, uerr = wire.awaitOpen(startStream, open)
+	} else {
+		opened, uerr = open()
+	}
+	tl.mark("取号+建流")
+	if uerr != nil {
+		status, message, typ, code := uerr.Status, FriendlyUpstream(uerr.Msg), "upstream_error", ""
+		switch status {
+		case 0, 503:
+			status, message, typ, code = 503, "无可用 Cursor 账号: "+message, "server_error", "no_account_available"
+		case 429:
 			typ = "rate_limit_error"
 		}
-		status := uerr.Status
-		if status == 0 {
-			status = 502
+		if ctx.Err() == nil {
+			if wire != nil && wire.started {
+				wire.write(chatStreamError(message, typ, code))
+			} else {
+				SendError(w, status, message, typ, code)
+			}
 		}
-		SendError(w, status, FriendlyUpstream(uerr.Msg), typ, "")
+		if ctx.Err() != nil {
+			status, uerr = clientClosedStatus, clientDisconnected()
+		}
+		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Stream: body.Stream, KeyPrefix: keyPrefix,
+			Status: "error", HTTPStatus: status, Ms: time.Since(startedAt).Milliseconds(), InputTokens: promptTokens,
+			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
 		return
 	}
 
 	account := opened.Account
-	events := Chain(opened.Buffered, opened.Stream)
+	defer opened.Stream.Close()
+	events := Chain(ctx, opened.Buffered, opened.Stream)
 
 	if body.Stream {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			SendError(w, 500, "streaming unsupported", "server_error", "")
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-
-		writeSSE := func(s string) {
-			fmt.Fprint(w, s)
-			flusher.Flush()
-		}
-		writeSSE(sseChunk(id, body.Model, map[string]any{"role": "assistant"}, nil))
+		startStream()
+		ticks := time.NewTicker(streamKeepalive)
+		defer ticks.Stop()
 
 		errored := false
 		errMsg := ""
+		terminalDelivered := false
 		var content, reasoning strings.Builder
 		// 有工具时用 Scanner 边流边剥离调用标签，避免半截标签漏给客户端。
 		var scanner *tools.Scanner
@@ -289,8 +318,10 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if text == "" {
 				return
 			}
-			content.WriteString(text)
-			writeSSE(sseChunk(id, body.Model, map[string]any{"content": text}, nil))
+			if wire.write(sseChunk(id, body.Model, map[string]any{"content": text}, nil)) {
+				wire.markOutput()
+				content.WriteString(text)
+			}
 		}
 
 		var nativeCalls []tools.Call
@@ -300,16 +331,20 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 否则长内容要等整个调用发完才一次性出现。
 		live := tools.NewLiveWriter(len(toolDefs) == 0)
 
-		for ev := range events {
+		for !errored {
+			ev, ok := wire.next(events, ticks.C)
+			if !ok {
+				break
+			}
 			switch ev.Kind {
 			case cursor.EventDelta:
 				if !gotFirst {
 					gotFirst = true
 					tl.mark("等首个增量")
 				}
-				if ev.Thinking != "" {
+				if ev.Thinking != "" && wire.write(sseChunk(id, body.Model, map[string]any{"reasoning_content": ev.Thinking}, nil)) {
+					wire.markOutput()
 					reasoning.WriteString(ev.Thinking)
-					writeSSE(sseChunk(id, body.Model, map[string]any{"reasoning_content": ev.Thinking}, nil))
 				}
 				if ev.Text != "" {
 					emitText(live.Interrupt())
@@ -336,12 +371,13 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			case cursor.EventError:
 				errored = true
 				errMsg = ev.Message
-				b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": ev.Message}})
-				writeSSE("data: " + string(b) + "\n\n")
+				terminalDelivered = wire.write(chatStreamError(FriendlyUpstream(ev.Message), "upstream_error", ""))
 			}
 		}
 
-		emitText(live.Interrupt())
+		if !errored && !wire.disconnected() {
+			emitText(live.Interrupt())
+		}
 		tl.mark("流式输出")
 
 		// 被时长上限掐断时报 length，别让半截回答看起来像正常收尾
@@ -350,26 +386,32 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			finish = "length"
 		}
 		calls := nativeCalls
-		if scanner != nil {
+		if scanner != nil && !errored && !wire.disconnected() {
 			emitText(scanner.Flush())
 			// 上游原生调用优先；模型自己按文本协议写的作为补充
 			calls = append(calls, scanner.Calls()...)
 		}
-		if len(calls) > 0 {
+		var deliveredCalls []tools.Call
+		if len(calls) > 0 && !errored && !wire.disconnected() {
 			for i, c := range calls {
-				writeSSE(sseChunk(id, body.Model, map[string]any{
+				if !wire.write(sseChunk(id, body.Model, map[string]any{
 					"tool_calls": []map[string]any{toolCallDelta(i, c)},
-				}, nil))
+				}, nil)) {
+					break
+				}
+				wire.markOutput()
+				deliveredCalls = append(deliveredCalls, c)
 			}
 			finish = "tool_calls"
 		}
-		writeSSE(sseChunk(id, body.Model, map[string]any{}, finish))
+		if !errored {
+			wire.write(sseChunk(id, body.Model, map[string]any{}, finish))
+		}
 
 		// 按 OpenAI 规范：仅在 stream_options.include_usage 为真时补一个
 		// choices 为空、只带 usage 的收尾分片。
-		completionTokens := tokenize.CountText(body.Model, content.String()) +
-			tokenize.CountText(body.Model, reasoning.String())
-		if body.StreamOptions != nil && body.StreamOptions.IncludeUsage {
+		completionTokens := countOutputTokens(body.Model, content.String(), reasoning.String(), deliveredCalls)
+		if !errored && body.StreamOptions != nil && body.StreamOptions.IncludeUsage && !wire.disconnected() {
 			payload, _ := json.Marshal(map[string]any{
 				"id":      id,
 				"object":  "chat.completion.chunk",
@@ -378,19 +420,26 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"choices": []any{},
 				"usage":   input.openAI(completionTokens),
 			})
-			writeSSE("data: " + string(payload) + "\n\n")
+			wire.write("data: " + string(payload) + "\n\n")
+		}
+		if !errored {
+			terminalDelivered = wire.write("data: [DONE]\n\n")
 		}
 
 		outcome := cursor.OutcomeSuccess
 		if errored {
 			outcome = cursor.OutcomeError
 		}
-		cursor.ReleaseAccount(account.ID, outcome, "")
+		httpStatus := 0
+		if !terminalDelivered && wire.disconnected() {
+			outcome, errored, errMsg, httpStatus = cursor.OutcomeCanceled, true, clientDisconnected().Msg, clientClosedStatus
+		}
+		cursor.ReleaseAccount(account.ID, outcome, errMsg)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(),
+			HTTPStatus: httpStatus, InputTokens: promptTokens, FirstTokenMs: wire.firstTokenMs(startedAt),
 			Chars: utf8.RuneCountInString(content.String()), Tokens: completionTokens,
 			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
-		writeSSE("data: [DONE]\n\n")
 		tl.done(fmt.Sprintf(" :: 提示 %d tok / 输出 %d tok / %d 字",
 			promptTokens, completionTokens, utf8.RuneCountInString(content.String())))
 		return
@@ -418,6 +467,13 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastError = ev.Message
 		}
 	}
+	if ctx.Err() != nil {
+		cursor.ReleaseAccount(account.ID, cursor.OutcomeCanceled, "")
+		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
+			Status: "error", HTTPStatus: clientClosedStatus, Ms: time.Since(startedAt).Milliseconds(),
+			InputTokens: promptTokens, Error: clientDisconnected().Msg, Request: reqlog.SanitizeRequest(raw)})
+		return
+	}
 
 	if len(toolDefs) > 0 {
 		var scanner tools.Scanner
@@ -428,17 +484,13 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if content == "" && len(toolCalls) == 0 && lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
-			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(),
+			Stream: false, Status: "error", HTTPStatus: 502, Ms: time.Since(startedAt).Milliseconds(), InputTokens: promptTokens,
 			Error: trunc(lastError, 200), Request: reqlog.SanitizeRequest(raw)})
 		SendError(w, 502, FriendlyUpstream(lastError), "upstream_error", "")
 		return
 	}
 
-	cursor.ReleaseAccount(account.ID, cursor.OutcomeSuccess, "")
-	completionTokens := tokenize.CountText(body.Model, content) + tokenize.CountText(body.Model, reasoning)
-	reqlog.Record(reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
-		Stream: false, Status: "ok", Ms: time.Since(startedAt).Milliseconds(),
-		Chars: utf8.RuneCountInString(content), Tokens: completionTokens})
+	completionTokens := countOutputTokens(body.Model, content, reasoning, toolCalls)
 
 	message := map[string]any{"role": "assistant", "content": content}
 	if reasoning != "" {
@@ -464,14 +516,25 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			message["content"] = nil
 		}
 	}
-	WriteJSON(w, 200, map[string]any{
+	entry := reqlog.Entry{Kind: "chat", Model: body.Model, Account: account.Label, KeyPrefix: keyPrefix,
+		Status: "ok", InputTokens: promptTokens, Chars: utf8.RuneCountInString(content), Tokens: completionTokens}
+	response := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   body.Model,
 		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": finishReason}},
 		"usage":   input.openAI(completionTokens),
-	})
+	}
+	outcome := cursor.OutcomeSuccess
+	if ctx.Err() != nil || WriteJSON(w, 200, response) != nil {
+		outcome = cursor.OutcomeCanceled
+		entry.Status, entry.HTTPStatus, entry.Error = "error", clientClosedStatus, clientDisconnected().Msg
+		entry.Chars, entry.Tokens, entry.Request = 0, 0, reqlog.SanitizeRequest(raw)
+	}
+	entry.Ms = time.Since(startedAt).Milliseconds()
+	cursor.ReleaseAccount(account.ID, outcome, "")
+	reqlog.Record(entry)
 }
 
 // toNativePtr 与 toNative 相同，但保留 nil 语义，供流式写出器判断。

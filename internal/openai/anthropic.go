@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -235,8 +236,13 @@ func sse(event string, data any) string {
 	return "event: " + event + "\ndata: " + string(b) + "\n\n"
 }
 
+func anthropicAPIError(message string) map[string]any {
+	return map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": message}}
+}
+
 // Messages 处理 POST /v1/messages（Anthropic 兼容）。
 func Messages(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
 	// 原始请求体留着：出错时记进日志，便于原样复现
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
 	if err != nil {
@@ -272,59 +278,84 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	messages = injectToolPrompt(messages, toolDefs, body.toolChoice())
 
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	startedAt := time.Now()
 	keyPrefix := anthropicKeyPrefix(r)
 	tl.mark("解析消息")
 	inputTokens := tokenize.CountMessages(model, messages)
 	input := splitInputUsage(inputTokens, store.GetSimulatedCache())
 	tl.mark("算 token")
 
-	opened, uerr := OpenWithFailover(messages, model, ModeFor(len(toolDefs)))
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	open := func() (*OpenedStream, *cursor.UpstreamError) {
+		return OpenWithFailover(ctx, messages, model, ModeFor(len(toolDefs)))
+	}
+	var opened *OpenedStream
+	var uerr *cursor.UpstreamError
+	var wire *sseResponse
+	var startStream func()
+	if body.Stream {
+		if _, ok := w.(http.Flusher); !ok {
+			WriteJSON(w, 500, anthropicAPIError("streaming unsupported"))
+			return
+		}
+		wire = newSSEResponse(ctx, cancel, w)
+		startStream = func() {
+			if wire.started {
+				return
+			}
+			wire.write(sse("message_start", map[string]any{
+				"type": "message_start",
+				"message": map[string]any{
+					"id": id, "type": "message", "role": "assistant", "model": model,
+					"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+					"usage": input.anthropic(0),
+				},
+			}))
+			wire.write(sse("ping", map[string]any{"type": "ping"}))
+		}
+		opened, uerr = wire.awaitOpen(startStream, open)
+	} else {
+		opened, uerr = open()
+	}
 	tl.markOpen(opened)
 	if uerr != nil {
-		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, KeyPrefix: keyPrefix, Stream: body.Stream,
-			Status: "error", HTTPStatus: uerr.Status, Ms: time.Since(startedAt).Milliseconds(),
-			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
 		status := 502
 		if uerr.Status >= 400 && uerr.Status < 600 {
 			status = uerr.Status
 		}
-		WriteJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": FriendlyUpstream(uerr.Msg)}})
+		if ctx.Err() == nil {
+			payload := anthropicAPIError(FriendlyUpstream(uerr.Msg))
+			if wire != nil && wire.started {
+				wire.write(sse("error", payload))
+			} else {
+				WriteJSON(w, status, payload)
+			}
+		}
+		if ctx.Err() != nil {
+			status, uerr = clientClosedStatus, clientDisconnected()
+		}
+		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, KeyPrefix: keyPrefix, Stream: body.Stream,
+			Status: "error", HTTPStatus: status, Ms: time.Since(startedAt).Milliseconds(), InputTokens: inputTokens,
+			Error: trunc(uerr.Msg, 200), Request: reqlog.SanitizeRequest(raw)})
 		return
 	}
 
 	account := opened.Account
-	events := Chain(opened.Buffered, opened.Stream)
+	defer opened.Stream.Close()
+	events := Chain(ctx, opened.Buffered, opened.Stream)
 
 	if body.Stream {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			WriteJSON(w, 500, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "streaming unsupported"}})
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-		send := func(ev string, d any) {
-			fmt.Fprint(w, sse(ev, d))
-			flusher.Flush()
+		startStream()
+		ticks := time.NewTicker(streamKeepalive)
+		defer ticks.Stop()
+		send := func(ev string, d any) bool {
+			return wire.write(sse(ev, d))
 		}
 
-		var content strings.Builder
+		var content, thinking strings.Builder
 		errored := false
 		errMsg := ""
-
-		// message_start 携带输入 token；输出 token 在 message_delta 里给出（Anthropic 规范）。
-		send("message_start", map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id": id, "type": "message", "role": "assistant", "model": model,
-				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-				"usage": input.anthropic(0),
-			},
-		})
-		send("ping", map[string]any{"type": "ping"})
+		terminalDelivered := false
 
 		// 思考内容单独占一个 thinking 块，排在正文之前。
 		// 早期这里直接丢掉推理，接 OpenCode 时用户完全看不到——实测一次问答
@@ -339,8 +370,10 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			if text == "" {
 				return
 			}
-			content.WriteString(text)
-			blk.text(text)
+			if blk.text(text) {
+				wire.markOutput()
+				content.WriteString(text)
+			}
 		}
 
 		var calls []tools.Call
@@ -349,14 +382,21 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		// 纯对话时把写文件的内容边收边吐，避免长内容静默几十秒再整段出现
 		live := tools.NewLiveWriter(len(toolDefs) == 0)
 
-		for ev := range events {
+		for !errored {
+			ev, ok := wire.next(events, ticks.C)
+			if !ok {
+				break
+			}
 			switch ev.Kind {
 			case cursor.EventDelta:
 				if !gotFirst {
 					gotFirst = true
 					tl.mark("等首个增量")
 				}
-				blk.thinking(ev.Thinking)
+				if blk.thinking(ev.Thinking) {
+					wire.markOutput()
+					thinking.WriteString(ev.Thinking)
+				}
 				if ev.Text != "" {
 					emitText(live.Interrupt())
 					if scanner != nil {
@@ -383,45 +423,53 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			case cursor.EventError:
 				errored = true
 				errMsg = ev.Message
+				terminalDelivered = send("error", anthropicAPIError(FriendlyUpstream(ev.Message)))
 			}
 		}
-		emitText(live.Interrupt())
+		if !errored && !wire.disconnected() {
+			emitText(live.Interrupt())
+		}
 
 		// 被时长上限掐断时报 max_tokens——Anthropic 侧最接近「没说完」的语义
 		stopReason := "end_turn"
 		if truncated {
 			stopReason = "max_tokens"
 		}
-		if scanner != nil {
+		if scanner != nil && !errored && !wire.disconnected() {
 			emitText(scanner.Flush())
 			calls = append(calls, scanner.Calls()...)
 		}
-		textIndex := blk.closeAll()
-
-		// 工具调用各占一个 tool_use 内容块，紧跟在文本块之后。
-		for i, c := range calls {
-			idx := textIndex + 1 + i
-			send("content_block_start", map[string]any{
-				"type": "content_block_start", "index": idx,
-				"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": map[string]any{}},
-			})
-			send("content_block_delta", map[string]any{
-				"type": "content_block_delta", "index": idx,
-				"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Arguments},
-			})
-			send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
-			stopReason = "tool_use"
+		var deliveredCalls []tools.Call
+		if !errored && !wire.disconnected() {
+			textIndex := blk.closeAll()
+			// 工具调用各占一个 tool_use 内容块，紧跟在文本块之后。
+			for i, c := range calls {
+				idx := textIndex + 1 + i
+				send("content_block_start", map[string]any{
+					"type": "content_block_start", "index": idx,
+					"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": map[string]any{}},
+				})
+				if !send("content_block_delta", map[string]any{
+					"type": "content_block_delta", "index": idx,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Arguments},
+				}) {
+					break
+				}
+				wire.markOutput()
+				deliveredCalls = append(deliveredCalls, c)
+				stopReason = "tool_use"
+				send("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+			}
 		}
-		if errored {
-			stopReason = "error"
+		outputTokens := countOutputTokens(model, content.String(), thinking.String(), deliveredCalls)
+		if !errored && !wire.disconnected() {
+			send("message_delta", map[string]any{
+				"type":  "message_delta",
+				"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
+				"usage": input.anthropic(outputTokens),
+			})
+			terminalDelivered = send("message_stop", map[string]any{"type": "message_stop"})
 		}
-		outputTokens := tokenize.CountText(model, content.String())
-		send("message_delta", map[string]any{
-			"type":  "message_delta",
-			"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-			"usage": input.anthropic(outputTokens),
-		})
-		send("message_stop", map[string]any{"type": "message_stop"})
 		tl.done(fmt.Sprintf(" :: 输入 %d tok / 输出 %d tok / %d 字",
 			inputTokens, outputTokens, utf8.RuneCountInString(content.String())))
 
@@ -429,9 +477,14 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		if errored {
 			outcome = cursor.OutcomeError
 		}
-		cursor.ReleaseAccount(account.ID, outcome, "")
+		httpStatus := 0
+		if !terminalDelivered && wire.disconnected() {
+			outcome, errored, errMsg, httpStatus = cursor.OutcomeCanceled, true, clientDisconnected().Msg, clientClosedStatus
+		}
+		cursor.ReleaseAccount(account.ID, outcome, errMsg)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
 			Stream: true, Status: statusOf(errored), Ms: time.Since(startedAt).Milliseconds(),
+			HTTPStatus: httpStatus, InputTokens: inputTokens, FirstTokenMs: wire.firstTokenMs(startedAt),
 			Chars: utf8.RuneCountInString(content.String()), Tokens: outputTokens,
 			Error: trunc(errMsg, 200), Request: requestOnError(errored, raw)})
 		return
@@ -457,6 +510,13 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 			lastError = ev.Message
 		}
 	}
+	if ctx.Err() != nil {
+		cursor.ReleaseAccount(account.ID, cursor.OutcomeCanceled, "")
+		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
+			Status: "error", HTTPStatus: clientClosedStatus, Ms: time.Since(startedAt).Milliseconds(),
+			InputTokens: inputTokens, Error: clientDisconnected().Msg, Request: reqlog.SanitizeRequest(raw)})
+		return
+	}
 
 	if len(toolDefs) > 0 {
 		var scanner tools.Scanner
@@ -467,17 +527,13 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 	if content == "" && len(toolCalls) == 0 && lastError != "" {
 		cursor.ReleaseAccount(account.ID, cursor.OutcomeError, lastError)
 		reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
-			Stream: false, Status: "error", Ms: time.Since(startedAt).Milliseconds(),
+			Stream: false, Status: "error", HTTPStatus: 502, Ms: time.Since(startedAt).Milliseconds(), InputTokens: inputTokens,
 			Error: trunc(lastError, 200), Request: reqlog.SanitizeRequest(raw)})
 		WriteJSON(w, 502, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": FriendlyUpstream(lastError)}})
 		return
 	}
 
-	cursor.ReleaseAccount(account.ID, cursor.OutcomeSuccess, "")
-	outputTokens := tokenize.CountText(model, content)
-	reqlog.Record(reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
-		Stream: false, Status: "ok", Ms: time.Since(startedAt).Milliseconds(),
-		Chars: utf8.RuneCountInString(content), Tokens: outputTokens})
+	outputTokens := countOutputTokens(model, content, "", toolCalls)
 	blocks := []map[string]any{}
 	if content != "" {
 		blocks = append(blocks, map[string]any{"type": "text", "text": content})
@@ -500,13 +556,24 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		blocks = append(blocks, map[string]any{"type": "text", "text": ""})
 	}
 
-	WriteJSON(w, 200, map[string]any{
+	entry := reqlog.Entry{Kind: "chat", Model: model, Account: account.Label, KeyPrefix: keyPrefix,
+		Status: "ok", InputTokens: inputTokens, Chars: utf8.RuneCountInString(content), Tokens: outputTokens}
+	response := map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": model,
 		"content":       blocks,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage":         input.anthropic(outputTokens),
-	})
+	}
+	outcome := cursor.OutcomeSuccess
+	if ctx.Err() != nil || WriteJSON(w, 200, response) != nil {
+		outcome = cursor.OutcomeCanceled
+		entry.Status, entry.HTTPStatus, entry.Error = "error", clientClosedStatus, clientDisconnected().Msg
+		entry.Chars, entry.Tokens, entry.Request = 0, 0, reqlog.SanitizeRequest(raw)
+	}
+	entry.Ms = time.Since(startedAt).Milliseconds()
+	cursor.ReleaseAccount(account.ID, outcome, "")
+	reqlog.Record(entry)
 }
 
 func anthropicKeyPrefix(r *http.Request) string {
@@ -525,16 +592,16 @@ func anthropicKeyPrefix(r *http.Request) string {
 // 推理和正文各占一个块，且推理必须排在正文前面；工具调用块再接在正文之后。
 // 下标要连续，空出一个号客户端就会解析错位，所以统一由它发号。
 type blockWriter struct {
-	send      func(string, any)
+	send      func(string, any) bool
 	next      int
 	thinkOpen bool
 	textIndex int
 }
 
 // thinking 追加一段推理。正文已经开始后就不再补，避免块顺序错乱。
-func (b *blockWriter) thinking(text string) {
+func (b *blockWriter) thinking(text string) bool {
 	if text == "" || b.textIndex > 0 || b.next > 0 && !b.thinkOpen {
-		return
+		return false
 	}
 	if !b.thinkOpen {
 		b.thinkOpen = true
@@ -542,14 +609,14 @@ func (b *blockWriter) thinking(text string) {
 			"index": b.next, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
 		b.next++
 	}
-	b.send("content_block_delta", map[string]any{"type": "content_block_delta",
+	return b.send("content_block_delta", map[string]any{"type": "content_block_delta",
 		"index": b.next - 1, "delta": map[string]any{"type": "thinking_delta", "thinking": text}})
 }
 
 // text 追加一段正文，必要时先收尾推理块并开出正文块。
-func (b *blockWriter) text(s string) {
+func (b *blockWriter) text(s string) bool {
 	b.openText()
-	b.send("content_block_delta", map[string]any{"type": "content_block_delta",
+	return b.send("content_block_delta", map[string]any{"type": "content_block_delta",
 		"index": b.textIndex, "delta": map[string]any{"type": "text_delta", "text": s}})
 }
 

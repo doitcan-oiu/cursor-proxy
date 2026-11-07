@@ -10,7 +10,7 @@ type recorder struct {
 	text  string
 }
 
-func (r *recorder) send(ev string, d any) {
+func (r *recorder) send(ev string, d any) bool {
 	m := d.(map[string]any)
 	switch ev {
 	case "content_block_start":
@@ -26,6 +26,7 @@ func (r *recorder) send(ev string, d any) {
 			r.text += dl["text"].(string)
 		}
 	}
+	return true
 }
 
 // 推理内容早期在 Anthropic 端点被整个丢弃：实测一次问答上游给了 3000 多字推理，

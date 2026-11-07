@@ -1,6 +1,18 @@
 package openai
 
-import "cursor-proxy/internal/store"
+import (
+	"cursor-proxy/internal/store"
+	"cursor-proxy/internal/tokenize"
+	"cursor-proxy/internal/tools"
+)
+
+func countOutputTokens(model, text, thinking string, calls []tools.Call) int {
+	total := tokenize.CountText(model, text) + tokenize.CountText(model, thinking)
+	for _, call := range calls {
+		total += tokenize.CountText(model, call.Name) + tokenize.CountText(model, call.Arguments)
+	}
+	return total
+}
 
 type inputUsage struct {
 	total      int

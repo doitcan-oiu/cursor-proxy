@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"math/rand"
 	"regexp"
 	"time"
@@ -45,9 +46,16 @@ type OpenedStream struct {
 	Attempts  int
 }
 
-func backoff(attempt int) {
+func backoff(ctx context.Context, attempt int) bool {
 	d := time.Duration(300*(attempt+1))*time.Millisecond + time.Duration(rand.Intn(300))*time.Millisecond
-	time.Sleep(d)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // ModeFor 按客户端是否声明工具挑选上游模式。
@@ -65,7 +73,7 @@ func ModeFor(toolCount int) proto.Mode {
 }
 
 // OpenWithFailover 带故障转移地打开对话流：先探帧，拿到正文前出错则换号重试。
-func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (*OpenedStream, *cursor.UpstreamError) {
+func OpenWithFailover(ctx context.Context, messages []types.Message, model string, mode proto.Mode) (*OpenedStream, *cursor.UpstreamError) {
 	ab := config.Get().Antiban
 	exclude := map[string]bool{}
 	var lastErr *cursor.UpstreamError
@@ -73,17 +81,21 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 
 	for attempt := 0; attempt < ab.MaxAttempts; attempt++ {
 		t0 := time.Now()
-		account := cursor.AcquireAccount(exclude)
+		account := cursor.AcquireAccountContext(ctx, exclude)
 		if account == nil {
 			break
 		}
 		acquireMs := time.Since(t0).Milliseconds()
 
 		t1 := time.Now()
-		stream, err := cursor.StreamAgent(messages, upstreamModel, account.Bearer, account.ProxyURL, mode)
+		stream, err := cursor.StreamAgentContext(ctx, messages, upstreamModel, account.Bearer, account.ProxyURL, mode)
 		connectMs := time.Since(t1).Milliseconds()
 		probeStart := time.Now()
 		if err != nil {
+			if ctx.Err() != nil {
+				cursor.ReleaseAccount(account.ID, cursor.OutcomeCanceled, "")
+				return nil, clientDisconnected()
+			}
 			status := 0
 			if aerr, ok := err.(*cursor.AgentUpstreamError); ok {
 				status = aerr.Status
@@ -95,10 +107,17 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 				if account.ID != "" {
 					exclude[account.ID] = true
 				}
-				backoff(attempt)
+				if !backoff(ctx, attempt) {
+					return nil, clientDisconnected()
+				}
 				continue
 			}
 			return nil, lastErr
+		}
+		if ctx.Err() != nil {
+			stream.Close()
+			cursor.ReleaseAccount(account.ID, cursor.OutcomeCanceled, "")
+			return nil, clientDisconnected()
 		}
 
 		var buffered []cursor.StreamEvent
@@ -125,6 +144,11 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 				break
 			}
 		}
+		if ctx.Err() != nil {
+			stream.Close()
+			cursor.ReleaseAccount(account.ID, cursor.OutcomeCanceled, "")
+			return nil, clientDisconnected()
+		}
 
 		// 上游偶尔会开流即结束、只吐思考不给正文。这种空转对 agent 客户端是致命的
 		// （它会以为轮次结束而卡住），重试一次通常就正常了。
@@ -136,7 +160,9 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 			stream.Close()
 			cursor.ReleaseAccount(account.ID, cursor.OutcomeSuccess, "")
 			lastErr = cursor.NewUpstreamError(502, "upstream returned an empty response")
-			backoff(attempt)
+			if !backoff(ctx, attempt) {
+				return nil, clientDisconnected()
+			}
 			continue
 		}
 
@@ -158,7 +184,9 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 				if account.ID != "" {
 					exclude[account.ID] = true
 				}
-				backoff(attempt)
+				if !backoff(ctx, attempt) {
+					return nil, clientDisconnected()
+				}
 				continue
 			}
 			return nil, lastErr
@@ -170,6 +198,9 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 			ProbeMs: time.Since(probeStart).Milliseconds(), Attempts: attempt + 1,
 		}, nil
 	}
+	if ctx.Err() != nil {
+		return nil, clientDisconnected()
+	}
 
 	if lastErr != nil {
 		return nil, cursor.NewUpstreamError(503, "all accounts failed: "+lastErr.Msg)
@@ -178,15 +209,27 @@ func OpenWithFailover(messages []types.Message, model string, mode proto.Mode) (
 }
 
 // Chain 先吐已缓存帧，再继续消费剩余流，统一到一个 channel。
-func Chain(buffered []cursor.StreamEvent, stream *cursor.AgentStream) <-chan cursor.StreamEvent {
+func Chain(ctx context.Context, buffered []cursor.StreamEvent, stream *cursor.AgentStream) <-chan cursor.StreamEvent {
 	out := make(chan cursor.StreamEvent, 32)
 	go func() {
 		defer close(out)
+		forward := func(ev cursor.StreamEvent) bool {
+			select {
+			case out <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 		for _, ev := range buffered {
-			out <- ev
+			if !forward(ev) {
+				return
+			}
 		}
 		for ev := range stream.Events {
-			out <- ev
+			if !forward(ev) {
+				return
+			}
 		}
 	}()
 	return out

@@ -30,9 +30,11 @@ func (w *capturingWriter) Write(b []byte) (int, error) {
 }
 
 func (w *capturingWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
+	_ = w.FlushError()
+}
+
+func (w *capturingWriter) FlushError() error {
+	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func withBodyDebug(next http.Handler) http.Handler {

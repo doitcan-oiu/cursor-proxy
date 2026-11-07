@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"context"
 	"math/rand"
 	"regexp"
 	"sort"
@@ -23,6 +24,8 @@ const (
 	OutcomeAuthFailed Outcome = "auth_failed"
 	// OutcomeError 其它错误。
 	OutcomeError Outcome = "error"
+	// OutcomeCanceled 下游断开，只归还账号租约。
+	OutcomeCanceled Outcome = "canceled"
 )
 
 type health struct {
@@ -125,10 +128,15 @@ func nowMs() int64 { return time.Now().UnixMilli() }
 
 // AcquireAccount 选一个健康、未达并发上限、满足最小间隔的账号并预占。
 func AcquireAccount(exclude map[string]bool) *AcquiredAccount {
+	return AcquireAccountContext(context.Background(), exclude)
+}
+
+// AcquireAccountContext 支持在等候、抖动或刷新凭证时取消取号。
+func AcquireAccountContext(ctx context.Context, exclude map[string]bool) *AcquiredAccount {
 	ab := config.Get().Antiban
 	deadline := nowMs() + int64(ab.AcquireTimeoutMs)
 
-	for {
+	for ctx.Err() == nil {
 		tokens := store.Read().CursorTokens
 		var chosen *store.CursorTokenEntry
 		var waitInterval int64 = -1
@@ -183,29 +191,39 @@ func AcquireAccount(exclude map[string]bool) *AcquiredAccount {
 		hmu.Unlock()
 
 		if chosen != nil {
-			if ab.JitterMs > 0 {
-				time.Sleep(time.Duration(rand.Intn(ab.JitterMs)) * time.Millisecond)
+			if ab.JitterMs > 0 && !waitForAccount(ctx, time.Duration(rand.Intn(ab.JitterMs))*time.Millisecond) {
+				ReleaseAccount(chosen.ID, OutcomeCanceled, "")
+				return nil
 			}
-			acc := finalizeAcquire(*chosen)
-			return &acc
+			freshBearer := ensureFreshToken(ctx, *chosen)
+			if ctx.Err() != nil {
+				ReleaseAccount(chosen.ID, OutcomeCanceled, "")
+				return nil
+			}
+			return &AcquiredAccount{Context: BuildContext(chosen.ID, freshBearer, true), Label: chosen.Label}
 		}
 
 		if waitInterval > 0 {
-			time.Sleep(time.Duration(waitInterval) * time.Millisecond)
+			if !waitForAccount(ctx, time.Duration(waitInterval)*time.Millisecond) {
+				return nil
+			}
 			continue
 		}
-		if nowMs() >= deadline {
+		if nowMs() >= deadline || !waitForAccount(ctx, 500*time.Millisecond) {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
 	}
+	return nil
 }
 
-func finalizeAcquire(entry store.CursorTokenEntry) AcquiredAccount {
-	freshBearer := EnsureFreshToken(entry)
-	return AcquiredAccount{
-		Context: BuildContext(entry.ID, freshBearer, true),
-		Label:   entry.Label,
+func waitForAccount(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -220,6 +238,9 @@ func ReleaseAccount(id string, outcome Outcome, errorMsg string) {
 	h := getHealth(id)
 	if h.inFlight > 0 {
 		h.inFlight--
+	}
+	if outcome == OutcomeCanceled {
+		return
 	}
 	h.lastOutcome = outcome
 	h.lastError = errorMsg

@@ -17,10 +17,10 @@ type ErrorBody struct {
 }
 
 // WriteJSON 写出 JSON 响应。
-func WriteJSON(w http.ResponseWriter, status int, v any) {
+func WriteJSON(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	return json.NewEncoder(w).Encode(v)
 }
 
 // SendError 以 OpenAI 风格 JSON 返回错误。
