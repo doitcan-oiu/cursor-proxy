@@ -8,11 +8,12 @@ import (
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/proto"
 	"cursor-proxy/internal/tools"
+	"cursor-proxy/internal/types"
 )
 
 const fileToolProvider = "cursor_proxy"
 
-// fileToolBridge registers operations whose Cursor built-in form is ambiguous or unavailable.
+// fileToolBridge registers operations whose Cursor built-in name or parameters are incompatible.
 // It records the original client names so only tools declared for this request can be returned.
 type fileToolBridge struct {
 	definitions []proto.MCPTool
@@ -21,7 +22,7 @@ type fileToolBridge struct {
 }
 
 func prepareFileTools(defs []tools.Definition) (fileToolBridge, []tools.Definition) {
-	selected := tools.ClientFileToolDefinitions(defs)
+	selected := tools.ClientMCPToolDefinitions(defs)
 	if len(selected) == 0 {
 		return fileToolBridge{}, defs
 	}
@@ -29,7 +30,8 @@ func prepareFileTools(defs []tools.Definition) (fileToolBridge, []tools.Definiti
 	registered := make(map[string]bool, len(selected))
 	var prompt strings.Builder
 	prompt.WriteString("The registered cursor_proxy MCP tools operate on the downstream client's workspace. " +
-		"Use the matching MCP tool for these operations. Cursor's local file tools address a different workspace.\n")
+		"For the operations below, invoke the exact MCP function shown, even when the request mentions only the client name. " +
+		"Do not substitute a Cursor built-in function for a listed client operation.\n")
 	for _, def := range selected {
 		if registered[def.Name] {
 			continue
@@ -60,6 +62,21 @@ func prepareFileTools(defs []tools.Definition) (fileToolBridge, []tools.Definiti
 		}
 	}
 	return bridge, remaining
+}
+
+func (b fileToolBridge) remind(messages []types.Message) []types.Message {
+	if b.prompt == "" {
+		return messages
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		out := append([]types.Message(nil), messages...)
+		out[i].Content = types.ContentToText(out[i].Content) + "\n\n" + b.prompt
+		return out
+	}
+	return messages
 }
 
 func (b fileToolBridge) mapCall(call *cursor.NativeToolCall) (tools.Call, bool) {

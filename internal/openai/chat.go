@@ -247,7 +247,7 @@ func ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fileTools, promptTools := prepareFileTools(toolDefs)
-	messages = injectToolPrompt(messages, promptTools, toolChoice)
+	messages = fileTools.remind(injectToolPrompt(messages, promptTools, toolChoice))
 	tl.mark("解析消息")
 
 	id := "chatcmpl-" + uuid.NewString()

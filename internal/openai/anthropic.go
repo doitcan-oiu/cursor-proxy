@@ -291,7 +291,7 @@ func Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fileTools, promptTools := prepareFileTools(toolDefs)
-	messages = injectToolPrompt(messages, promptTools, toolChoice)
+	messages = fileTools.remind(injectToolPrompt(messages, promptTools, toolChoice))
 
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	keyPrefix := anthropicKeyPrefix(r)

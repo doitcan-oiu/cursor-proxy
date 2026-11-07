@@ -44,6 +44,11 @@ func TestNativeToolContracts(t *testing.T) {
 			want:   `{"command":"pwd","workdir":"/tmp/project","description":"Show directory"}`,
 		},
 		{
+			name: "exec_command", native: Native{Kind: KindRunTerminal, Command: "Write-Output PROBE", Path: `C:\workspace`},
+			schema: `{"properties":{"cmd":{"type":"string"},"workdir":{"type":"string"}},"required":["cmd"]}`,
+			want:   `{"cmd":"Write-Output PROBE","workdir":"C:\\workspace"}`,
+		},
+		{
 			name: "Grep", native: Native{Kind: KindSearchFiles, Pattern: "^func", Path: "/tmp/project", Glob: "*.go", OutputMode: "content"},
 			schema: `{"properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"output_mode":{"type":"string"}},"required":["pattern"]}`,
 			want:   `{"pattern":"^func","path":"/tmp/project","glob":"*.go","output_mode":"content"}`,
@@ -206,6 +211,28 @@ func TestMapNativeRunTerminal(t *testing.T) {
 	// bash 的 schema 把 description 列为必填，必须补上
 	if args["description"] != "List files" {
 		t.Fatalf("必填的 description 未补全: %v", args)
+	}
+}
+
+func TestLegacyCodexShellKeepsCommandArraySchema(t *testing.T) {
+	t.Setenv("NATIVE_TOOL_BRIDGE", "on")
+	argvShell := Definition{
+		Name:       "shell",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"}}},"required":["command"]}`),
+	}
+	stringShell := Definition{
+		Name:       "shell",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
+	}
+	cmd := Native{Kind: KindRunTerminal, Command: "Write-Output PROBE"}
+	if _, ok := MapNative(cmd, []Definition{argvShell}); ok {
+		t.Fatal("native command string must not be sent to a shell expecting argv")
+	}
+	if _, ok := MapNative(cmd, []Definition{stringShell}); !ok {
+		t.Fatal("a shell accepting command strings should still use the native bridge")
+	}
+	if got := ClientMCPToolDefinitions([]Definition{argvShell, stringShell}); !reflect.DeepEqual(got, []Definition{argvShell}) {
+		t.Fatalf("scoped MCP definitions should preserve the original argv schema, got %+v", got)
 	}
 }
 

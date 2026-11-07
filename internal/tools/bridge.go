@@ -89,7 +89,7 @@ var candidateNames = map[NativeKind][]string{
 	},
 	KindRunTerminal: {
 		"bash", "shell", "run_terminal_cmd", "run_command", "execute_command",
-		"terminal", "exec", "run", "command",
+		"exec_command", "terminal", "exec", "run", "command",
 	},
 	KindSearchFiles: {
 		"grep", "search", "grep_search", "ripgrep", "search_files", "codebase_search",
@@ -387,8 +387,13 @@ func matchesNativeParams(kind NativeKind, def Definition) bool {
 	if len(def.Parameters) == 0 {
 		return true
 	}
-	if _, ok := matchParam(kind, def); !ok {
+	param, ok := matchParam(kind, def)
+	if !ok {
 		return false
+	}
+	if kind == KindRunTerminal {
+		typ := schemaPropertyType(def, param)
+		return typ == "" || typ == "string"
 	}
 	if kind == KindWriteFile {
 		_, ok := matchContentParam(def)
@@ -399,6 +404,12 @@ func matchesNativeParams(kind NativeKind, def Definition) bool {
 
 func matchParam(kind NativeKind, def Definition) (string, bool) {
 	return matchNamedParam(def, candidateParams[kind]...)
+}
+
+func schemaPropertyType(def Definition, param string) string {
+	property, _ := schemaProperties(def)[param].(map[string]any)
+	typ, _ := property["type"].(string)
+	return typ
 }
 
 func defaultDescription(kind NativeKind) string {
@@ -589,19 +600,31 @@ func FileToolsNeedDistinctCalls(defs []Definition) bool {
 	return write && edit
 }
 
-// ClientFileToolDefinitions selects tools that need a distinct identity upstream.
-func ClientFileToolDefinitions(defs []Definition) []Definition {
+// ClientMCPToolDefinitions selects tools that need distinct upstream names or schemas.
+func ClientMCPToolDefinitions(defs []Definition) []Definition {
 	if !NativeBridgeEnabled() {
 		return nil
 	}
 	mixedEdits := FileToolsNeedDistinctCalls(defs)
 	var selected []Definition
 	for _, d := range defs {
-		if _, list := matchTool(KindListFiles, []Definition{d}); list || isPartialEditTool(d) || (mixedEdits && isNativeWriteTool(d)) {
+		if _, list := matchTool(KindListFiles, []Definition{d}); list || isPartialEditTool(d) || isArgvShellTool(d) || (mixedEdits && isNativeWriteTool(d)) {
 			selected = append(selected, d)
 		}
 	}
 	return selected
+}
+
+func isArgvShellTool(def Definition) bool {
+	name := def.Name
+	if tool := mcpToolName(name); tool != "" {
+		name = tool
+	}
+	if !strings.EqualFold(name, "shell") {
+		return false
+	}
+	param, ok := matchParam(KindRunTerminal, def)
+	return ok && schemaPropertyType(def, param) == "array"
 }
 
 func isPartialEditTool(def Definition) bool {

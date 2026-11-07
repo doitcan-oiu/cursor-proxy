@@ -2,10 +2,12 @@ package openai
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"cursor-proxy/internal/cursor"
 	"cursor-proxy/internal/tools"
+	"cursor-proxy/internal/types"
 )
 
 func TestMixedFileToolsRejectAmbiguousNativeCall(t *testing.T) {
@@ -27,5 +29,19 @@ func TestMixedFileToolsRejectAmbiguousNativeCall(t *testing.T) {
 	}
 	if msg, code := out.completionError(choice, false); msg != "" || code != "" {
 		t.Fatalf("successful text retry should clear the error, got %q %q", msg, code)
+	}
+}
+
+func TestClientToolReminderKeepsToolResultLast(t *testing.T) {
+	bridge, _ := prepareFileTools([]tools.Definition{{Name: "Write"}, {Name: "Edit"}})
+	messages := []types.Message{
+		{Role: "user", Content: "Write to the workspace"},
+		{Role: "tool", Content: "Read succeeded", ToolCallID: "read-1"},
+	}
+	got := bridge.remind(messages)
+	user := types.ContentToText(got[0].Content)
+	if !strings.Contains(user, "mcp__cursor_proxy__client_write") || !strings.Contains(user, "mcp__cursor_proxy__client_edit") ||
+		got[1].Role != "tool" || got[1].ToolCallID != "read-1" || messages[0].Content != "Write to the workspace" {
+		t.Fatalf("tool reminder changed conversation history or omitted the registered routes: %+v", got)
 	}
 }
