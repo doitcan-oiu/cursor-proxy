@@ -1,0 +1,24 @@
+services:
+  cursor-proxy:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3100"
+      DATA_DIR: /data
+    ports:
+      - "${HOST:-0.0.0.0}:${PORT:-3100}:3100"
+    volumes:
+      - type: bind
+        source: ${DATA_DIR:-./.data}
+        target: /data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3100/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

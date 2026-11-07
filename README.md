@@ -5,6 +5,26 @@
 
 ## 快速开始
 
+### Docker Compose
+
+在仓库根目录使用 Docker Compose v2.24 或更新版本启动。镜像会把仓库中的管理界面构建产物嵌入 Go 服务。
+
+```bash
+docker compose up -d --build
+docker compose logs -f cursor-proxy
+```
+
+管理界面默认在 `http://127.0.0.1:3100`，API 地址为 `http://127.0.0.1:3100/v1`。管理口令可从启动日志获取。
+默认将宿主机的 `./.data` 挂载到容器的 `/data`，账号、代理 Key、自动生成的管理口令和 VPN 配置会保留。
+如果原来直接运行二进制，先停止原进程，再让 Compose 挂载同一个数据目录。Windows 上已下载的 Mihomo 内核需要在容器里重新安装 Linux 版。
+
+需要调整配置时，将 `.env.example` 复制为 `.env` 再修改。Compose 用 `HOST` 和 `PORT` 设置宿主机的监听地址和端口，用 `DATA_DIR` 指定宿主机数据目录。
+例如用 `HOST=127.0.0.1` 限制为本机访问，用 `SIMULATED_CACHE_PERCENT=80` 模拟 80% 的缓存读取。修改 `.env` 后执行 `docker compose up -d` 使配置生效。
+使用宿主机上的 HTTP 代理时，请将 `CURSOR_HTTP_PROXY` 指向容器能访问的地址。在 Docker Desktop 上可以使用 `host.docker.internal`。
+在 ARM64 容器中使用内置 VPN 时，通过 `MIHOMO_URL` 指定对应架构的 Linux `.gz` 内核。
+
+### 直接运行二进制
+
 ```bash
 cd go-script
 cp .env.example .env        # 按需修改；ADMIN_TOKEN 留空会自动生成
