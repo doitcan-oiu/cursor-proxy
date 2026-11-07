@@ -498,8 +498,11 @@ func TestStreamEndsImmediatelyOnEndOfStreamFrame(t *testing.T) {
 	}
 }
 
-func TestStreamCancellationAfterWriteback(t *testing.T) {
+func TestStreamCancellationAfterTurnCompletion(t *testing.T) {
 	completed := func() []byte { return append(contentFrame("hi"), conversationFrame(4)...) }
+	// AgentServerMessage.interaction_update (1) 内含空的 TurnEndedUpdate (14)。
+	turnEnded := frame(0x00, []byte{0x0a, 0x02, 0x72, 0x00})
+	ended := func() []byte { return append(contentFrame("hi"), turnEnded...) }
 	args := proto.NewWriter()
 	args.Str(1, "/tmp/a.txt")
 	toolCall := toolCallFrame("call", toolReadFile, args)
@@ -514,6 +517,11 @@ func TestStreamCancellationAfterWriteback(t *testing.T) {
 		{"completed response", completed(), 0x02, "canceled", EventEnd},
 		{"completed response with a separate error frame", completed(), 0x00, "canceled", EventEnd},
 		{"completed tool-only response", append(toolCall, conversationFrame(4)...), 0x02, "canceled", EventEnd},
+		{"turn ended without writeback", ended(), 0x02, "canceled", EventEnd},
+		{"turn ended with separate error frame", ended(), 0x00, "canceled", EventEnd},
+		{"turn ended with no output", turnEnded, 0x02, "canceled", EventError},
+		{"response continued after turn ended", append(ended(), contentFrame(" again")...), 0x02, "canceled", EventError},
+		{"other error after turn ended", ended(), 0x02, "internal", EventError},
 		{"partial response", contentFrame("hi"), 0x02, "canceled", EventError},
 		{"response continued after writeback", append(completed(), contentFrame(" again")...), 0x02, "canceled", EventError},
 		{"tool announced after writeback", append(completed(), progressFrame("call", toolWriteFile, "/tmp/a.txt")...), 0x02, "canceled", EventError},

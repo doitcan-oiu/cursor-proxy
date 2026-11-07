@@ -122,7 +122,7 @@ func (s *agentStreamState) emitErrorFrame(payload string, send func(StreamEvent)
 	if json.Unmarshal([]byte(payload), &j) != nil || j.Error == nil {
 		return
 	}
-	// 已产出正文或完整工具调用并回写了会话记录，尾部取消只表示上游关闭流。
+	// 已产出正文或完整工具调用，并确认本轮结束后，尾部取消只表示上游关闭流。
 	if j.Error.Code == "canceled" && s.turnComplete && (s.gotContent || s.sawToolCall) {
 		return
 	}
@@ -341,10 +341,11 @@ const (
 	fieldHeartbeat     = 13 // StreamMessage 内的心跳（约 10s 一次）
 )
 
-// StreamMessage 里与工具调用相关的字段。
+// StreamMessage 里的更新字段。
 const (
 	smToolCallDone     = 2  // 调用完成：{ 1: 调用 id, 2: 参数容器, 3: 消息 id }
 	smToolCallProgress = 7  // 调用进行中：结构同上，参数尚不完整
+	smTurnEnded        = 14 // TurnEndedUpdate：轮次结束，可附带用量
 	smToolInputDelta   = 15 // 参数流式片段：{ 1: 调用 id, 2{3{1: 文本片段}} }
 )
 
@@ -766,7 +767,7 @@ type agentStreamState struct {
 	// sawGeneration 表示生成阶段已开始。用于区分开头回写的会话上下文
 	// 与结尾回写的会话记录——两者都是 fieldConversation 帧。
 	sawGeneration bool
-	// turnComplete 表示上游已把整轮对话持久化，即本轮生成结束。
+	// turnComplete 表示收到轮次结束事件，或在生成后收到会话记录回写。
 	turnComplete bool
 	// sawToolCall 表示本轮下发过内置工具调用。此时即便没有正文也是正常结果，
 	// 不应被上层当成空响应而重试。
@@ -826,6 +827,10 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 				continue
 			}
 			s.sawGeneration = true
+			if proto.FirstBytes(smFields, smTurnEnded) != nil {
+				s.turnComplete = true
+				continue
+			}
 
 			// 「进行中」帧先到：记下这次调用的工具类型与路径，
 			// 后续的参数片段才知道该不该转发。
